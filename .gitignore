@@ -1,0 +1,26 @@
+/target/
+/build/
+/probes/java/build/
+*.dex
+
+# Proprietary firmware copies and station recordings stay local.
+/dump/
+*.apk
+*.so
+*.raw
+*.pcm
+*.wav
+
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+__pycache__/
+*.pyc
+.venv/
+*.log
+/.claude/settings.local.json
+
+# ~/.gitignore_global ignores CLAUDE.md; this repo keeps it.
+!/CLAUDE.md
