@@ -137,27 +137,6 @@ pub fn announce_urls(preannounce: String, media: String) -> Vec<String> {
         .collect()
 }
 
-/// A finished HA timer rings once the station is free: never on top of a dialog or an
-/// announcement.
-#[derive(Debug, Default)]
-pub struct AlertQueue {
-    pending: bool,
-}
-
-impl AlertQueue {
-    pub fn request(&mut self) {
-        self.pending = true;
-    }
-
-    pub fn take_if_free(&mut self, free: bool) -> bool {
-        let go = self.pending && free;
-        if go {
-            self.pending = false;
-        }
-        go
-    }
-}
-
 pub const ALERT_RATE: u32 = 16_000;
 const ALERT_HZ: f32 = 880.0;
 const ALERT_AMPLITUDE: f32 = 0.25;
@@ -303,16 +282,6 @@ mod tests {
         assert_eq!(announce_urls(String::new(), "m".into()), ["m"]);
         assert_eq!(announce_urls("p".into(), "m".into()), ["p", "m"]);
         assert!(announce_urls(String::new(), String::new()).is_empty());
-    }
-
-    #[test]
-    fn alert_waits_until_the_station_is_free_and_rings_once() {
-        let mut q = AlertQueue::default();
-        assert!(!q.take_if_free(true));
-        q.request();
-        assert!(!q.take_if_free(false));
-        assert!(q.take_if_free(true));
-        assert!(!q.take_if_free(true));
     }
 
     #[test]

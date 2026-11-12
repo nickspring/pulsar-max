@@ -1,6 +1,7 @@
 /target/
 /build/
 /probes/java/build/
+/probes/c/build/
 /android/helper/build/
 *.dex
 

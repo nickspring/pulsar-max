@@ -7,6 +7,7 @@
 mod capture;
 mod controller;
 mod helper;
+mod input;
 mod player;
 #[allow(unsafe_code)]
 mod sys;
@@ -27,7 +28,8 @@ use pulsar_esphome::{ApiConfig, DeviceIdentity};
 use pulsar_lan::mdns::{self, MdnsService};
 use tokio::signal::unix::{Signal, SignalKind, signal};
 
-use controller::{Controller, Flow, MUSIC_STYLES};
+use controller::{Controller, Flow, MUSIC_STYLES, Tick};
+use max_core::dialog::Sounds;
 
 pub(crate) const VERSION: &str = match option_env!("PULSAR_MAX_VERSION") {
     Some(v) => v,
@@ -41,6 +43,7 @@ const DEFAULT_DATA_DIR: &str = "/data/pulsar-max";
 const API_PORT: u16 = 6053;
 pub(crate) const ESPHOME_SERVICE: &str = "_esphomelib._tcp";
 const ALERT_FILE: &str = "timer_alert.wav";
+const STOCK_SOUNDS: &str = "/data/data/com.yandex.io.sdk/files/system/sounds/common";
 const TEARDOWN_SECS: u64 = 5;
 
 fn main() -> ExitCode {
@@ -110,8 +113,8 @@ async fn run(data_dir: &Path) -> u8 {
         music_styles: MUSIC_STYLES.iter().map(|s| (*s).to_owned()).collect(),
         has_clock: false,
         has_lux: false,
-        has_hw_mic_mute: false,
-        has_buttons: false,
+        has_hw_mic_mute: true,
+        has_buttons: true,
         has_auto_brightness: false,
         key_path: Some(data_dir.join("api.key")),
         ..ApiConfig::default()
@@ -154,21 +157,28 @@ async fn run(data_dir: &Path) -> u8 {
     };
 
     let dex = helper::dex_path();
-    let alert = data_dir.join(ALERT_FILE);
-    if let Err(e) = std::fs::write(&alert, max_core::media::alert_wav()) {
-        warn!("{}: {e}", alert.display());
-    }
+    let sounds = sounds(data_dir);
     let (player, mut player_events) = player::spawn(dex.clone());
     let mic_taken = yandex::take_mic();
     let (capture, mut audio) = capture::spawn(dex);
-    let mut ctl = Controller::new(api, player, mdns, alert);
+    let (_input, mut keys) = input::spawn();
+    let mut ctl = Controller::new(api, player, mdns, sounds);
     ctl.publish_all();
     info!("pulsar-max {VERSION} running as {name}");
 
     loop {
         tokio::select! {
             biased;
-            t = ctl.timers().next() => ctl.on_timer(t),
+            t = ctl.timers().next() => {
+                // Keypad contract: a release already read goes before its press's long-press tick.
+                if t == Tick::Keypad {
+                    while let Ok(ev) = keys.try_recv() {
+                        ctl.on_input(ev);
+                    }
+                }
+                ctl.on_timer(t);
+            }
+            Some(ev) = keys.recv() => ctl.on_input(ev),
             Some(ev) = api_events.recv() => {
                 if let Flow::Exit = ctl.on_api(ev) {
                     break;
@@ -181,7 +191,6 @@ async fn run(data_dir: &Path) -> u8 {
             _ = hup.recv() => break,
             _ = quit.recv() => break,
         }
-        ctl.after_event();
     }
     let restored = Arc::new(AtomicBool::new(!mic_taken));
     arm_teardown_watchdog(restored.clone());
@@ -191,6 +200,30 @@ async fn run(data_dir: &Path) -> u8 {
         restored.store(true, Ordering::Relaxed);
     }
     0
+}
+
+/// io.sdk's own sound files, read in place (docs/max.md).
+fn sounds(data_dir: &Path) -> Sounds {
+    let stock = |name: &str| {
+        let path = Path::new(STOCK_SOUNDS).join(name);
+        path.is_file().then(|| path.to_string_lossy().into_owned())
+    };
+    let timer = stock("timer.wav").or_else(|| {
+        let alert = data_dir.join(ALERT_FILE);
+        match std::fs::write(&alert, max_core::media::alert_wav()) {
+            Ok(()) => Some(alert.to_string_lossy().into_owned()),
+            Err(e) => {
+                warn!("{}: {e}", alert.display());
+                None
+            }
+        }
+    });
+    Sounds {
+        start: stock("spotter_start.ogg"),
+        cancel: stock("spotter_cancel.ogg"),
+        error: stock("error.wav"),
+        timer,
+    }
 }
 
 /// pulsar's teardown watchdog; here it also returns the microphone to io.sdk, which a hung

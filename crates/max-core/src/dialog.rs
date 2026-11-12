@@ -22,7 +22,7 @@ pub enum Va {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Phase {
+enum Phase {
     Idle,
     Listening,
     Processing,
@@ -42,11 +42,32 @@ pub struct PlayId(pub u64);
 pub enum Timer {
     Watchdog,
     FollowupWait,
+    RingTick,
+    RingTimeout,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HaTimerEvent {
+    Started,
+    Updated,
+    Cancelled,
+    Finished,
+}
+
+/// Without `timer` a finished HA timer does not ring.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Sounds {
+    pub start: Option<String>,
+    pub cancel: Option<String>,
+    pub error: Option<String>,
+    pub timer: Option<String>,
 }
 
 pub const LISTEN_TIMEOUT_MS: u64 = 30_000;
 pub const PROCESS_TIMEOUT_MS: u64 = 120_000;
 pub const FOLLOWUP_DURATION_MAX_S: u32 = 10;
+pub const RING_TICK_MS: u64 = 300;
+pub const TIMER_RING_MAX_MS: u64 = 15 * 60 * 1000;
 
 // HA's VAD sends STT_VAD_START only after 0.3 s of speech.
 const FOLLOWUP_VAD_GRACE_MS: u64 = 1000;
@@ -134,8 +155,8 @@ impl Followup {
         }
     }
 
-    fn should_continue(&self, ok: bool, seconds: u32) -> bool {
-        ok && self.requested && seconds > 0
+    fn should_continue(&self, ok: bool, seconds: u32, blocked: bool) -> bool {
+        ok && self.requested && !blocked && seconds > 0
     }
 
     fn next_turn(self) -> Self {
@@ -155,8 +176,10 @@ impl Followup {
 #[derive(Clone, Copy, Debug)]
 enum Pending {
     Tts { dialog: u64 },
+    Earcon { seq: u64 },
     Announce { conv: bool, seq: u64 },
     MediaAnnounce { seq: u64 },
+    Ring { cycle: u64 },
 }
 
 /// Port of pulsar's controller/voice.rs and controller/logic.rs (tag v0.6.1).
@@ -175,10 +198,20 @@ pub struct Dialog {
     tts_report_owed: bool,
     followup: Followup,
     pending: HashMap<PlayId, Pending>,
+    sounds: Sounds,
+    closing_earcon: bool,
+    earcon_seq: u64,
+    timer_ringing: bool,
+    ring_yielded: bool,
+    ring_tick_armed: bool,
+    /// Checked only between rounds, as pulsar does: the timeout never cuts a sound.
+    ring_expired: bool,
+    /// Bumped when a ring ends: the cut round's late `done` must not tick the next ring.
+    ring_cycle: u64,
 }
 
 impl Dialog {
-    pub fn new(followup_s: u32) -> Self {
+    pub fn new(followup_s: u32, sounds: Sounds) -> Self {
         Self {
             phase: Phase::Idle,
             followup_s: followup_s.min(FOLLOWUP_DURATION_MAX_S),
@@ -194,15 +227,15 @@ impl Dialog {
             tts_report_owed: false,
             followup: Followup::default(),
             pending: HashMap::new(),
+            sounds,
+            closing_earcon: false,
+            earcon_seq: 0,
+            timer_ringing: false,
+            ring_yielded: false,
+            ring_tick_armed: false,
+            ring_expired: false,
+            ring_cycle: 0,
         }
-    }
-
-    pub fn phase(&self) -> Phase {
-        self.phase
-    }
-
-    pub fn announcing(&self) -> bool {
-        self.announcing
     }
 
     pub fn set_followup_duration(&mut self, seconds: u32, fx: &mut impl Effects) {
@@ -220,23 +253,26 @@ impl Dialog {
     }
 
     pub fn button(&mut self, fx: &mut impl Effects) {
-        if self.phase == Phase::Idle && !self.announcing {
-            self.start("", fx);
-            return;
+        if self.timer_ringing {
+            return self.stop_timer_ring(fx);
         }
-        self.interrupt_speech(fx);
-        self.end_interaction(fx);
-    }
-
-    pub fn start(&mut self, phrase: &str, fx: &mut impl Effects) -> bool {
-        if !self.can_listen(fx) {
-            return false;
+        if matches!(self.phase, Phase::Listening | Phase::Processing) {
+            return self.cancel_dialog(fx);
         }
         if self.phase == Phase::Speaking || self.announcing {
             self.interrupt_speech(fx);
+            return self.end_interaction(fx);
         }
-        self.listen(phrase, fx);
-        true
+        self.start("", fx);
+    }
+
+    /// While the timer rings this only stops the ring: the wake word is a stop word then.
+    pub fn start(&mut self, phrase: &str, fx: &mut impl Effects) -> bool {
+        if self.timer_ringing && self.mic_enabled {
+            self.stop_timer_ring(fx);
+            return false;
+        }
+        self.begin_dialog(phrase, true, fx)
     }
 
     pub fn on_va(&mut self, ev: Va, data: &HashMap<String, String>, fx: &mut impl Effects) {
@@ -286,8 +322,16 @@ impl Dialog {
                 }
                 self.play_tts(fx);
             }
-            // pulsar tells error codes apart only for its error ring and earcons.
-            Va::Error => self.stop_streaming(fx),
+            Va::Error => {
+                self.stop_streaming(fx);
+                // HA takes one wake word per 2 s across satellites: on a duplicate another answers.
+                if !matches!(
+                    get("code"),
+                    "duplicate_wake_up_detected" | "stt-no-text-recognized"
+                ) {
+                    self.play_closing_earcon(self.sounds.error.clone(), fx);
+                }
+            }
             Va::RunEnd => {
                 self.stop_streaming(fx);
                 if !self.tts_played {
@@ -365,34 +409,72 @@ impl Dialog {
                 if dialog == self.dialog && self.phase == Phase::Speaking {
                     self.tts_finished(ok, fx);
                 }
+                self.resume_ring(fx);
+            }
+            Pending::Earcon { seq } => {
+                if seq == self.earcon_seq {
+                    self.closing_earcon = false;
+                    self.update_duck(fx);
+                }
             }
             Pending::Announce { conv, seq } => {
                 fx.announce_finished(ok);
                 if seq == self.announce_seq {
                     self.announcing = false;
-                    if ok && conv && self.phase == Phase::Idle {
-                        self.start("", fx);
+                    if ok && conv && self.phase == Phase::Idle && !self.timer_ringing {
+                        self.begin_dialog("", false, fx);
                     }
                     self.end_announce(fx);
                 }
+                self.resume_ring(fx);
             }
             Pending::MediaAnnounce { seq } => {
                 if seq == self.announce_seq {
                     self.announcing = false;
                     self.end_announce(fx);
                 }
+                self.resume_ring(fx);
+            }
+            Pending::Ring { cycle } => {
+                if cycle == self.ring_cycle && !self.ring_tick_armed {
+                    self.ring_tick_armed = true;
+                    fx.arm(Timer::RingTick, RING_TICK_MS);
+                }
             }
         }
     }
 
+    /// As in pulsar, the ring belongs to no single timer, so `Cancelled` does not stop it.
+    pub fn on_ha_timer(&mut self, ev: HaTimerEvent, fx: &mut impl Effects) {
+        if ev != HaTimerEvent::Finished || self.timer_ringing || self.sounds.timer.is_none() {
+            return;
+        }
+        self.timer_ringing = true;
+        self.ring_expired = false;
+        fx.arm(Timer::RingTimeout, TIMER_RING_MAX_MS);
+        self.update_duck(fx);
+        self.ring_timer(fx);
+    }
+
     pub fn on_timer(&mut self, timer: Timer, fx: &mut impl Effects) {
         // Effects does not promise that a cancelled timer never fires.
-        let live = match timer {
-            Timer::Watchdog => matches!(self.phase, Phase::Listening | Phase::Processing),
-            Timer::FollowupWait => self.awaiting_followup_speech(),
-        };
-        if live {
-            self.end_interaction(fx);
+        match timer {
+            Timer::Watchdog => {
+                if matches!(self.phase, Phase::Listening | Phase::Processing) {
+                    self.end_interaction(fx);
+                }
+            }
+            Timer::FollowupWait => {
+                if self.awaiting_followup_speech() {
+                    self.end_interaction(fx);
+                }
+            }
+            Timer::RingTick => {
+                if self.ring_tick_armed {
+                    self.ring_timer(fx);
+                }
+            }
+            Timer::RingTimeout => self.ring_expired = self.timer_ringing,
         }
     }
 
@@ -400,7 +482,18 @@ impl Dialog {
         fx.voice_subscribed() && self.mic_enabled
     }
 
-    fn listen(&mut self, phrase: &str, fx: &mut impl Effects) {
+    fn begin_dialog(&mut self, phrase: &str, earcon: bool, fx: &mut impl Effects) -> bool {
+        if !self.can_listen(fx) {
+            return false;
+        }
+        if self.phase == Phase::Speaking || self.announcing {
+            self.interrupt_speech(fx);
+        }
+        self.listen(phrase, earcon, fx);
+        true
+    }
+
+    fn listen(&mut self, phrase: &str, earcon: bool, fx: &mut impl Effects) {
         fx.cancel(Timer::FollowupWait);
         self.phase = Phase::Listening;
         self.dialog += 1;
@@ -410,6 +503,9 @@ impl Dialog {
         self.tts_played = false;
         self.followup = Followup::default();
         self.update_duck(fx);
+        if earcon && let Some(url) = self.sounds.start.clone() {
+            fx.play(Channel::Announce, vec![url]);
+        }
         // HA applies AnnounceFinished by forcing idle: an answer's report must not arrive over the
         // new dialog's listening state.
         self.send_tts_report(false, fx);
@@ -456,10 +552,11 @@ impl Dialog {
     fn tts_finished(&mut self, ok: bool, fx: &mut impl Effects) {
         self.send_tts_report(ok, fx);
         let followup = self.followup;
+        let blocked = self.timer_ringing || !self.can_listen(fx);
         // Not start(): it would cut an announcement that began after the answer. Unlike pulsar, a
         // refused follow-up start ends the dialog instead of leaving it SPEAKING.
-        if followup.should_continue(ok, self.followup_s) && self.can_listen(fx) {
-            self.listen("", fx);
+        if followup.should_continue(ok, self.followup_s, blocked) {
+            self.listen("", false, fx);
             self.followup = followup.next_turn();
             return;
         }
@@ -515,6 +612,28 @@ impl Dialog {
         }
     }
 
+    /// Error and cancel sounds outlive the dialog they close; music stays ducked until they end.
+    fn play_closing_earcon(&mut self, url: Option<String>, fx: &mut impl Effects) {
+        let Some(url) = url else {
+            return;
+        };
+        self.closing_earcon = true;
+        self.earcon_seq += 1;
+        let id = fx.play(Channel::Announce, vec![url]);
+        self.pending.insert(
+            id,
+            Pending::Earcon {
+                seq: self.earcon_seq,
+            },
+        );
+    }
+
+    fn cancel_dialog(&mut self, fx: &mut impl Effects) {
+        self.interrupt_speech(fx);
+        self.play_closing_earcon(self.sounds.cancel.clone(), fx);
+        self.end_interaction(fx);
+    }
+
     fn begin_announce(&mut self, fx: &mut impl Effects) -> u64 {
         self.announcing = true;
         self.announce_seq += 1;
@@ -529,7 +648,54 @@ impl Dialog {
     }
 
     fn update_duck(&self, fx: &mut impl Effects) {
-        fx.set_duck(self.phase != Phase::Idle || self.announcing);
+        fx.set_duck(
+            self.phase != Phase::Idle
+                || self.announcing
+                || self.timer_ringing
+                || self.closing_earcon,
+        );
+    }
+
+    fn ring_timer(&mut self, fx: &mut impl Effects) {
+        fx.cancel(Timer::RingTick);
+        self.ring_tick_armed = false;
+        if self.ring_expired {
+            return self.end_ring(fx);
+        }
+        if self.announcing || self.phase == Phase::Speaking {
+            self.ring_yielded = true;
+            return;
+        }
+        if let Some(url) = self.sounds.timer.clone() {
+            let id = fx.play(Channel::Announce, vec![url]);
+            self.pending.insert(
+                id,
+                Pending::Ring {
+                    cycle: self.ring_cycle,
+                },
+            );
+        }
+    }
+
+    fn resume_ring(&mut self, fx: &mut impl Effects) {
+        if std::mem::take(&mut self.ring_yielded) {
+            self.ring_timer(fx);
+        }
+    }
+
+    fn stop_timer_ring(&mut self, fx: &mut impl Effects) {
+        self.interrupt_speech(fx); // the ring, or the speech it yielded to
+        self.end_ring(fx);
+    }
+
+    fn end_ring(&mut self, fx: &mut impl Effects) {
+        self.timer_ringing = false;
+        self.ring_yielded = false;
+        self.ring_tick_armed = false;
+        self.ring_cycle += 1;
+        fx.cancel(Timer::RingTick);
+        fx.cancel(Timer::RingTimeout);
+        self.update_duck(fx);
     }
 }
 
@@ -704,10 +870,35 @@ mod tests {
         fx: Fx,
     }
 
+    const START: &str = "start.wav";
+    const CANCEL: &str = "cancel.wav";
+    const ERROR: &str = "error.wav";
+    const RING: &str = "timer.wav";
+
+    fn sound(url: &str) -> (Channel, Vec<String>) {
+        (Channel::Announce, vec![url.to_owned()])
+    }
+
     impl Rig {
         fn new(followup_s: u32) -> Self {
+            Self::with_sounds(followup_s, Sounds::default())
+        }
+
+        fn loud() -> Self {
+            Self::with_sounds(
+                5,
+                Sounds {
+                    start: Some(START.into()),
+                    cancel: Some(CANCEL.into()),
+                    error: Some(ERROR.into()),
+                    timer: Some(RING.into()),
+                },
+            )
+        }
+
+        fn with_sounds(followup_s: u32, sounds: Sounds) -> Self {
             Self {
-                d: Dialog::new(followup_s),
+                d: Dialog::new(followup_s, sounds),
                 fx: Fx {
                     subscribed: true,
                     calls: Vec::new(),
@@ -718,7 +909,7 @@ mod tests {
         }
 
         fn phase(&self) -> Phase {
-            self.d.phase()
+            self.d.phase
         }
 
         fn ev(&mut self, ev: Va, kv: &[(&str, &str)]) {
@@ -739,6 +930,23 @@ mod tests {
 
         fn timer(&mut self, t: Timer) {
             self.d.on_timer(t, &mut self.fx);
+        }
+
+        fn ha_timer(&mut self, ev: HaTimerEvent) {
+            self.d.on_ha_timer(ev, &mut self.fx);
+        }
+
+        fn ringing() -> (Self, PlayId) {
+            let mut r = Self::loud();
+            r.ha_timer(HaTimerEvent::Finished);
+            assert!(r.d.timer_ringing);
+            let ring = r.fx.last_play();
+            (r, ring)
+        }
+
+        fn run_started(&mut self) {
+            assert!(self.start(""));
+            self.ev(Va::RunStart, &[("url", URL)]);
         }
 
         fn done(&mut self, id: PlayId, ok: bool) {
@@ -891,13 +1099,14 @@ mod tests {
     #[test]
     fn followup_needs_ha_request_success_and_nonzero_duration() {
         let mut f = Followup::default();
-        assert!(!f.should_continue(true, 10));
+        assert!(!f.should_continue(true, 10, false));
         f.on_event(Va::IntentEnd, true);
-        assert!(f.should_continue(true, 10));
-        assert!(!f.should_continue(true, 0));
-        assert!(!f.should_continue(false, 10));
+        assert!(f.should_continue(true, 10, false));
+        assert!(!f.should_continue(true, 10, true));
+        assert!(!f.should_continue(true, 0, false));
+        assert!(!f.should_continue(false, 10, false));
         f.on_event(Va::IntentEnd, false);
-        assert!(!f.should_continue(true, 10));
+        assert!(!f.should_continue(true, 10, false));
     }
 
     #[test]
@@ -905,12 +1114,12 @@ mod tests {
         let mut f = Followup::default();
         f.on_event(Va::IntentEnd, true);
         f.on_event(Va::Error, false);
-        assert!(!f.should_continue(true, 10));
+        assert!(!f.should_continue(true, 10, false));
         f.on_event(Va::IntentEnd, true);
-        assert!(!f.should_continue(true, 10));
+        assert!(!f.should_continue(true, 10, false));
         f.on_event(Va::RunStart, false);
         f.on_event(Va::IntentEnd, true);
-        assert!(f.should_continue(true, 10));
+        assert!(f.should_continue(true, 10, false));
     }
 
     #[test]
@@ -1027,7 +1236,7 @@ mod tests {
         r.clear();
         assert!(r.start("alice"));
         assert_eq!(r.phase(), Phase::Listening);
-        assert!(!r.d.announcing());
+        assert!(!r.d.announcing);
         assert_eq!(r.fx.shown_announcing(), Some(false));
         assert_eq!(r.fx.count(&Call::StopPlay(Channel::Announce)), 1);
         assert!(
@@ -1337,10 +1546,10 @@ mod tests {
         r.done(tts, true);
         assert_eq!(r.phase(), Phase::Listening);
         assert_eq!(r.fx.count(&Call::StopPlay(Channel::Announce)), 0);
-        assert!(r.d.announcing());
+        assert!(r.d.announcing);
         r.done(ann, true);
         assert_eq!(r.fx.acks(), vec![true]);
-        assert!(!r.d.announcing());
+        assert!(!r.d.announcing);
         assert_eq!(r.phase(), Phase::Listening);
     }
 
@@ -1571,11 +1780,11 @@ mod tests {
         let mut r = Rig::new(5);
         let ann = r.announce(true);
         r.d.on_link_lost(&mut r.fx);
-        assert!(r.d.announcing());
+        assert!(r.d.announcing);
         r.done(ann, true);
         assert!(r.fx.acks().is_empty());
         assert!(r.fx.runs_started().is_empty());
-        assert!(!r.d.announcing());
+        assert!(!r.d.announcing);
         assert_eq!(r.fx.shown_announcing(), Some(false));
         assert_eq!(r.fx.duck(), Some(false));
         assert_eq!(r.phase(), Phase::Idle);
@@ -1626,6 +1835,7 @@ mod tests {
             r.assert_ended();
             assert_eq!(r.fx.count(&Call::StopPlay(Channel::Announce)), 1);
             assert_eq!(r.fx.stops(), 1);
+            assert!(r.fx.plays().is_empty());
         }
     }
 
@@ -1647,7 +1857,7 @@ mod tests {
         let mut r = Rig::new(5);
         let ann = r.announce(true);
         r.button();
-        assert!(!r.d.announcing());
+        assert!(!r.d.announcing);
         assert_eq!(r.fx.shown_announcing(), Some(false));
         assert_eq!(r.fx.count(&Call::StopPlay(Channel::Announce)), 1);
         r.assert_ended();
@@ -1674,7 +1884,7 @@ mod tests {
     fn announcement_plays_ducked_and_is_acked_once() {
         let mut r = Rig::new(5);
         let ann = r.announce(false);
-        assert!(r.d.announcing());
+        assert!(r.d.announcing);
         assert_eq!(r.phase(), Phase::Idle);
         assert_eq!(
             r.fx.plays(),
@@ -1684,7 +1894,7 @@ mod tests {
         assert_eq!(r.fx.duck(), Some(true));
         r.done(ann, true);
         assert_eq!(r.fx.acks(), vec![true]);
-        assert!(!r.d.announcing());
+        assert!(!r.d.announcing);
         assert_eq!(r.fx.shown_announcing(), Some(false));
         assert_eq!(r.fx.duck(), Some(false));
         assert!(r.fx.runs_started().is_empty());
@@ -1733,11 +1943,11 @@ mod tests {
         let second = r.announce(false);
         r.done(first, false);
         assert_eq!(r.fx.acks(), vec![false]);
-        assert!(r.d.announcing());
+        assert!(r.d.announcing);
         assert_eq!(r.fx.duck(), Some(true));
         r.done(second, true);
         assert_eq!(r.fx.acks(), vec![false, true]);
-        assert!(!r.d.announcing());
+        assert!(!r.d.announcing);
         assert!(r.fx.runs_started().is_empty());
     }
 
@@ -1748,7 +1958,7 @@ mod tests {
         r.ev(Va::TtsEnd, &[]);
         r.done(ann, false);
         assert_eq!(r.fx.acks(), vec![false]);
-        assert!(!r.d.announcing());
+        assert!(!r.d.announcing);
         assert_eq!(r.fx.shown_announcing(), Some(false));
         assert_eq!(r.phase(), Phase::Speaking);
         assert_eq!(r.fx.duck(), Some(true));
@@ -1759,7 +1969,7 @@ mod tests {
         let mut r = Rig::new(5);
         r.d.on_media_announce("http://ha.local/doorbell.mp3".into(), &mut r.fx);
         let id = r.fx.last_play();
-        assert!(r.d.announcing());
+        assert!(r.d.announcing);
         assert_eq!(
             r.fx.plays(),
             vec![(
@@ -1771,7 +1981,7 @@ mod tests {
         assert_eq!(r.fx.duck(), Some(true));
         r.done(id, true);
         assert!(r.fx.acks().is_empty());
-        assert!(!r.d.announcing());
+        assert!(!r.d.announcing);
         assert_eq!(r.fx.shown_announcing(), Some(false));
         assert_eq!(r.fx.duck(), Some(false));
     }
@@ -1784,9 +1994,525 @@ mod tests {
         r.d.on_media_announce("b".into(), &mut r.fx);
         let second = r.fx.last_play();
         r.done(first, false);
-        assert!(r.d.announcing());
+        assert!(r.d.announcing);
         r.done(second, true);
-        assert!(!r.d.announcing());
+        assert!(!r.d.announcing);
         assert!(r.fx.acks().is_empty());
+    }
+
+    #[test]
+    fn button_and_outside_start_play_the_start_earcon_before_the_run() {
+        for button in [true, false] {
+            let mut r = Rig::loud();
+            if button {
+                r.button();
+            } else {
+                assert!(r.start("alice"));
+            }
+            assert_eq!(r.phase(), Phase::Listening);
+            assert_eq!(r.fx.plays(), vec![sound(START)]);
+            let earcon = Call::Play(Channel::Announce, vec![START.into()]);
+            assert!(r.fx.index(&Call::Duck(true)) < r.fx.index(&earcon));
+            assert!(r.fx.index(&earcon) < r.fx.index(&Call::Streaming(true)));
+            let id = r.fx.last_play();
+            r.clear();
+            r.done(id, true);
+            assert!(r.fx.calls.is_empty());
+        }
+    }
+
+    #[test]
+    fn start_earcon_waits_for_the_cut_answer_to_stop() {
+        let mut r = Rig::loud();
+        r.start("");
+        r.answer(true, false);
+        r.clear();
+        assert!(r.start("again"));
+        assert!(
+            r.fx.index(&Call::StopPlay(Channel::Announce))
+                < r.fx
+                    .index(&Call::Play(Channel::Announce, vec![START.into()]))
+        );
+    }
+
+    #[test]
+    fn no_start_earcon_without_its_sound() {
+        let mut r = Rig::new(5);
+        r.button();
+        assert_eq!(r.phase(), Phase::Listening);
+        assert!(r.fx.plays().is_empty());
+    }
+
+    #[test]
+    fn follow_up_turn_has_no_start_earcon() {
+        let mut r = Rig::loud();
+        r.start("");
+        let tts = r.answer(true, true);
+        r.clear();
+        r.done(tts, true);
+        assert_eq!(r.phase(), Phase::Listening);
+        assert!(r.fx.plays().is_empty());
+    }
+
+    #[test]
+    fn announcement_conversation_has_no_start_earcon() {
+        let mut r = Rig::loud();
+        let ann = r.announce(true);
+        r.clear();
+        r.done(ann, true);
+        assert_eq!(r.phase(), Phase::Listening);
+        assert!(r.fx.plays().is_empty());
+    }
+
+    #[test]
+    fn button_cancel_plays_the_cancel_earcon_and_keeps_music_ducked_until_it_ends() {
+        for processing in [false, true] {
+            let mut r = Rig::loud();
+            r.run_started();
+            if processing {
+                r.ev(Va::SttEnd, &[]);
+            }
+            r.clear();
+            r.button();
+            assert_eq!(r.phase(), Phase::Idle);
+            assert_eq!(r.fx.stops(), 1);
+            assert_eq!(r.fx.streaming(), Some(false));
+            assert_eq!(r.fx.plays(), vec![sound(CANCEL)]);
+            assert!(
+                r.fx.index(&Call::StopPlay(Channel::Announce))
+                    < r.fx
+                        .index(&Call::Play(Channel::Announce, vec![CANCEL.into()]))
+            );
+            assert_eq!(r.fx.duck(), Some(true));
+            let earcon = r.fx.last_play();
+            r.done(earcon, false);
+            assert_eq!(r.fx.duck(), Some(false));
+        }
+    }
+
+    #[test]
+    fn button_cutting_an_answer_or_announcement_plays_no_earcon() {
+        let mut r = Rig::loud();
+        r.start("");
+        r.answer(true, false);
+        r.clear();
+        r.button();
+        assert!(r.fx.plays().is_empty());
+        r.assert_ended();
+
+        let mut r = Rig::loud();
+        r.announce(false);
+        r.clear();
+        r.button();
+        assert!(r.fx.plays().is_empty());
+        assert_eq!(r.fx.duck(), Some(false));
+    }
+
+    #[test]
+    fn pipeline_error_plays_the_error_earcon_and_keeps_music_ducked_until_it_ends() {
+        for code in ["stt-stream-failed", "intent-failed", ""] {
+            let mut r = Rig::loud();
+            r.run_started();
+            r.clear();
+            r.ev(Va::Error, &[("code", code)]);
+            assert_eq!(r.fx.plays(), vec![sound(ERROR)], "{code}");
+            assert_eq!(r.phase(), Phase::Processing, "{code}");
+            let earcon = r.fx.last_play();
+            r.ev(Va::RunEnd, &[]);
+            assert_eq!(r.phase(), Phase::Idle, "{code}");
+            assert_eq!(r.fx.duck(), Some(true), "{code}");
+            r.done(earcon, true);
+            assert_eq!(r.fx.duck(), Some(false), "{code}");
+        }
+    }
+
+    #[test]
+    fn duplicate_wake_and_no_text_errors_play_no_earcon() {
+        for code in ["duplicate_wake_up_detected", "stt-no-text-recognized"] {
+            let mut r = Rig::loud();
+            r.run_started();
+            r.clear();
+            r.ev(Va::Error, &[("code", code)]);
+            r.ev(Va::RunEnd, &[]);
+            assert!(r.fx.plays().is_empty(), "{code}");
+            r.assert_ended();
+        }
+    }
+
+    #[test]
+    fn only_the_latest_closing_earcon_releases_the_duck() {
+        let mut r = Rig::loud();
+        r.run_started();
+        r.ev(Va::Error, &[("code", "intent-failed")]);
+        let error = r.fx.last_play();
+        r.button();
+        let cancel = r.fx.last_play();
+        assert_eq!(r.fx.plays()[1..], [sound(ERROR), sound(CANCEL)]);
+        r.clear();
+        r.done(error, false);
+        assert!(r.fx.calls.is_empty());
+        r.done(cancel, true);
+        assert_eq!(r.fx.calls, vec![Call::Duck(false)]);
+    }
+
+    #[test]
+    fn closing_earcon_cut_by_an_announcement_hands_the_duck_to_it() {
+        let mut r = Rig::loud();
+        r.run_started();
+        r.button();
+        let cancel = r.fx.last_play();
+        let ann = r.announce(false);
+        r.done(cancel, false);
+        assert_eq!(r.fx.duck(), Some(true));
+        r.done(ann, true);
+        assert_eq!(r.fx.duck(), Some(false));
+    }
+
+    #[test]
+    fn only_a_finished_timer_rings() {
+        let mut r = Rig::loud();
+        for ev in [
+            HaTimerEvent::Started,
+            HaTimerEvent::Updated,
+            HaTimerEvent::Cancelled,
+        ] {
+            r.ha_timer(ev);
+            assert!(!r.d.timer_ringing, "{ev:?}");
+        }
+        assert!(r.fx.calls.is_empty());
+        r.ha_timer(HaTimerEvent::Finished);
+        assert!(r.d.timer_ringing);
+        assert_eq!(r.fx.plays(), vec![sound(RING)]);
+    }
+
+    #[test]
+    fn finished_timer_rings_ducked_within_the_ring_timeout() {
+        let (r, _) = Rig::ringing();
+        assert_eq!(r.fx.plays(), vec![sound(RING)]);
+        assert_eq!(r.fx.duck(), Some(true));
+        assert!(
+            r.fx.index(&Call::Duck(true))
+                < r.fx
+                    .index(&Call::Play(Channel::Announce, vec![RING.into()]))
+        );
+        assert_eq!(r.fx.armed(Timer::RingTimeout), Some(TIMER_RING_MAX_MS));
+        assert_eq!(r.phase(), Phase::Idle);
+        assert!(!r.d.announcing);
+        assert_eq!(r.fx.shown_announcing(), None);
+    }
+
+    #[test]
+    fn finished_timer_without_a_timer_sound_does_not_ring() {
+        let mut r = Rig::new(5);
+        r.ha_timer(HaTimerEvent::Finished);
+        assert!(!r.d.timer_ringing);
+        assert!(r.fx.calls.is_empty());
+        r.button();
+        assert_eq!(r.phase(), Phase::Listening);
+    }
+
+    #[test]
+    fn ring_repeats_after_a_pause() {
+        let (mut r, ring) = Rig::ringing();
+        r.clear();
+        r.done(ring, true);
+        assert_eq!(r.fx.calls, vec![Call::Arm(Timer::RingTick, RING_TICK_MS)]);
+        r.timer(Timer::RingTick);
+        assert_eq!(r.fx.plays(), vec![sound(RING)]);
+        assert_eq!(r.fx.armed(Timer::RingTick), None);
+        let ring = r.fx.last_play();
+        r.done(ring, false);
+        assert_eq!(r.fx.armed(Timer::RingTick), Some(RING_TICK_MS));
+        assert!(r.d.timer_ringing);
+    }
+
+    #[test]
+    fn ring_tick_is_ignored_unless_armed() {
+        let (mut r, _) = Rig::ringing();
+        r.clear();
+        r.timer(Timer::RingTick);
+        assert!(r.fx.calls.is_empty());
+        r.button();
+        r.clear();
+        r.timer(Timer::RingTick);
+        r.timer(Timer::RingTimeout);
+        assert!(r.fx.calls.is_empty());
+    }
+
+    #[test]
+    fn second_finished_timer_joins_the_running_ring() {
+        let (mut r, _) = Rig::ringing();
+        r.clear();
+        r.ha_timer(HaTimerEvent::Finished);
+        assert!(r.fx.calls.is_empty());
+        assert!(r.d.timer_ringing);
+    }
+
+    #[test]
+    fn cancelled_or_updated_timer_does_not_stop_the_ring() {
+        let (mut r, _) = Rig::ringing();
+        r.clear();
+        for ev in [
+            HaTimerEvent::Started,
+            HaTimerEvent::Updated,
+            HaTimerEvent::Cancelled,
+        ] {
+            r.ha_timer(ev);
+            assert!(r.d.timer_ringing, "{ev:?}");
+        }
+        assert!(r.fx.calls.is_empty());
+    }
+
+    #[test]
+    fn ring_gives_up_after_the_round_that_outlives_the_timeout() {
+        let (mut r, ring) = Rig::ringing();
+        r.timer(Timer::RingTimeout);
+        assert!(r.d.timer_ringing);
+        assert_eq!(r.fx.count(&Call::StopPlay(Channel::Announce)), 0);
+        r.done(ring, true);
+        r.clear();
+        r.timer(Timer::RingTick);
+        assert!(!r.d.timer_ringing);
+        assert!(r.fx.plays().is_empty());
+        assert_eq!(r.fx.count(&Call::StopPlay(Channel::Announce)), 0);
+        assert_eq!(r.fx.count(&Call::Cancel(Timer::RingTimeout)), 1);
+        assert_eq!(r.fx.duck(), Some(false));
+    }
+
+    #[test]
+    fn ring_timeout_does_not_cut_the_speech_the_ring_yielded_to() {
+        let (mut r, ring) = Rig::ringing();
+        let ann = r.announce(false);
+        r.done(ring, false);
+        r.timer(Timer::RingTick);
+        r.timer(Timer::RingTimeout);
+        assert!(r.d.announcing);
+        assert_eq!(r.fx.count(&Call::StopPlay(Channel::Announce)), 0);
+        r.clear();
+        r.done(ann, true);
+        assert!(!r.d.timer_ringing);
+        assert!(r.fx.plays().is_empty());
+        assert_eq!(r.fx.duck(), Some(false));
+    }
+
+    #[test]
+    fn expired_ring_leaves_the_announcement_that_cut_its_round() {
+        let (mut r, ring) = Rig::ringing();
+        r.timer(Timer::RingTimeout);
+        let ann = r.announce(false);
+        r.done(ring, false);
+        r.clear();
+        r.timer(Timer::RingTick);
+        assert!(!r.d.timer_ringing);
+        assert!(r.d.announcing);
+        assert_eq!(r.fx.count(&Call::StopPlay(Channel::Announce)), 0);
+        assert_eq!(r.fx.shown_announcing(), None);
+        assert_eq!(r.fx.duck(), Some(true));
+        r.clear();
+        r.done(ann, true);
+        assert_eq!(r.fx.acks(), vec![true]);
+        assert!(r.fx.plays().is_empty());
+        assert_eq!(r.fx.duck(), Some(false));
+    }
+
+    #[test]
+    fn expired_ring_leaves_the_announcement_that_superseded_the_one_it_yielded_to() {
+        let (mut r, ring) = Rig::ringing();
+        let first = r.announce(false);
+        r.done(ring, false);
+        r.timer(Timer::RingTick);
+        r.timer(Timer::RingTimeout);
+        let second = r.announce(false);
+        r.clear();
+        r.done(first, false);
+        assert!(!r.d.timer_ringing);
+        assert!(r.d.announcing);
+        assert_eq!(r.fx.count(&Call::StopPlay(Channel::Announce)), 0);
+        assert_eq!(r.fx.shown_announcing(), None);
+        assert_eq!(r.fx.duck(), Some(true));
+        r.clear();
+        r.done(second, true);
+        assert_eq!(r.fx.acks(), vec![true]);
+        assert!(r.fx.plays().is_empty());
+        assert_eq!(r.fx.shown_announcing(), Some(false));
+        assert_eq!(r.fx.duck(), Some(false));
+    }
+
+    #[test]
+    fn late_round_of_a_stopped_ring_does_not_tick_the_next_ring() {
+        let (mut r, old) = Rig::ringing();
+        r.button();
+        r.ha_timer(HaTimerEvent::Finished);
+        let new = r.fx.last_play();
+        r.clear();
+        r.done(old, false);
+        assert!(r.fx.calls.is_empty());
+        r.timer(Timer::RingTick);
+        assert!(r.fx.calls.is_empty());
+        r.done(new, true);
+        assert_eq!(r.fx.calls, vec![Call::Arm(Timer::RingTick, RING_TICK_MS)]);
+    }
+
+    #[test]
+    fn stopped_expired_ring_does_not_expire_the_next_one() {
+        let (mut r, _) = Rig::ringing();
+        r.timer(Timer::RingTimeout);
+        r.button();
+        r.ha_timer(HaTimerEvent::Finished);
+        let ring = r.fx.last_play();
+        r.done(ring, true);
+        r.clear();
+        r.timer(Timer::RingTick);
+        assert!(r.d.timer_ringing);
+        assert_eq!(r.fx.plays(), vec![sound(RING)]);
+    }
+
+    #[test]
+    fn ring_yields_to_an_answer_and_blocks_its_follow_up() {
+        let mut r = Rig::loud();
+        r.run_started();
+        r.ev(Va::SttEnd, &[]);
+        r.ha_timer(HaTimerEvent::Finished);
+        let ring = r.fx.last_play();
+        assert_eq!(r.fx.plays().last(), Some(&sound(RING)));
+        r.ev(Va::IntentEnd, &[("continue_conversation", "1")]);
+        r.ev(Va::TtsStart, &[]);
+        r.ev(Va::TtsEnd, &[]);
+        let tts = r.fx.last_play();
+        r.done(ring, false);
+        r.clear();
+        r.timer(Timer::RingTick);
+        assert!(r.fx.plays().is_empty());
+        r.done(tts, true);
+        assert_eq!(r.phase(), Phase::Idle);
+        assert!(r.fx.runs_started().is_empty());
+        assert_eq!(r.fx.answers(), vec![true]);
+        assert_eq!(r.fx.plays(), vec![sound(RING)]);
+        assert_eq!(r.fx.duck(), Some(true));
+        assert!(r.d.timer_ringing);
+    }
+
+    #[test]
+    fn follow_up_is_not_continued_while_the_timer_rings() {
+        let mut r = Rig::loud();
+        r.start("");
+        let tts = r.answer(true, true);
+        r.clear();
+        r.ha_timer(HaTimerEvent::Finished);
+        assert!(r.fx.plays().is_empty());
+        r.done(tts, true);
+        assert_eq!(r.phase(), Phase::Idle);
+        assert!(r.fx.runs_started().is_empty());
+        assert_eq!(r.fx.plays(), vec![sound(RING)]);
+    }
+
+    #[test]
+    fn ring_yields_to_an_announcement_whose_conversation_is_blocked() {
+        let (mut r, ring) = Rig::ringing();
+        let ann = r.announce(true);
+        r.done(ring, false);
+        r.clear();
+        r.timer(Timer::RingTick);
+        assert!(r.fx.plays().is_empty());
+        r.done(ann, true);
+        assert_eq!(r.fx.acks(), vec![true]);
+        assert!(r.fx.runs_started().is_empty());
+        assert_eq!(r.phase(), Phase::Idle);
+        assert_eq!(r.fx.plays(), vec![sound(RING)]);
+        assert_eq!(r.fx.shown_announcing(), Some(false));
+        assert_eq!(r.fx.duck(), Some(true));
+    }
+
+    #[test]
+    fn ring_waits_for_the_last_of_overlapping_announcements() {
+        let (mut r, ring) = Rig::ringing();
+        let first = r.announce(false);
+        r.done(ring, false);
+        r.timer(Timer::RingTick);
+        let second = r.announce(false);
+        r.clear();
+        r.done(first, false);
+        assert!(r.fx.plays().is_empty());
+        r.done(second, true);
+        assert_eq!(r.fx.plays(), vec![sound(RING)]);
+    }
+
+    #[test]
+    fn ring_resumes_after_a_media_announcement() {
+        let (mut r, ring) = Rig::ringing();
+        r.d.on_media_announce("doorbell".into(), &mut r.fx);
+        let ann = r.fx.last_play();
+        r.done(ring, false);
+        r.timer(Timer::RingTick);
+        r.clear();
+        r.done(ann, true);
+        assert_eq!(r.fx.plays(), vec![sound(RING)]);
+        assert!(r.d.timer_ringing);
+    }
+
+    #[test]
+    fn button_while_ringing_only_stops_the_ring() {
+        let (mut r, _) = Rig::ringing();
+        r.clear();
+        r.button();
+        assert!(!r.d.timer_ringing);
+        assert_eq!(r.fx.count(&Call::StopPlay(Channel::Announce)), 1);
+        assert_eq!(r.fx.armed(Timer::RingTick), None);
+        assert_eq!(r.fx.armed(Timer::RingTimeout), None);
+        assert_eq!(r.fx.duck(), Some(false));
+        assert!(r.fx.runs_started().is_empty());
+        assert!(r.fx.plays().is_empty());
+        assert_eq!(r.phase(), Phase::Idle);
+    }
+
+    #[test]
+    fn button_while_ringing_in_a_dialog_leaves_the_dialog() {
+        let mut r = Rig::loud();
+        r.run_started();
+        r.ha_timer(HaTimerEvent::Finished);
+        assert_eq!(r.fx.plays().last(), Some(&sound(RING)));
+        r.clear();
+        r.button();
+        assert!(!r.d.timer_ringing);
+        assert_eq!(r.phase(), Phase::Listening);
+        assert_eq!(r.fx.stops(), 0);
+        assert!(r.fx.plays().is_empty());
+        assert_eq!(r.fx.duck(), Some(true));
+    }
+
+    #[test]
+    fn button_while_ringing_cuts_the_answer_the_ring_yielded_to() {
+        let mut r = Rig::loud();
+        r.start("");
+        let tts = r.answer(true, false);
+        r.ha_timer(HaTimerEvent::Finished);
+        r.button();
+        assert!(!r.d.timer_ringing);
+        assert_eq!(r.fx.count(&Call::StopPlay(Channel::Announce)), 1);
+        r.clear();
+        r.done(tts, false);
+        r.assert_ended();
+        assert!(r.fx.plays().is_empty());
+    }
+
+    #[test]
+    fn start_while_ringing_only_stops_the_ring() {
+        let (mut r, _) = Rig::ringing();
+        r.clear();
+        assert!(!r.start("alice"));
+        assert!(!r.d.timer_ringing);
+        assert!(r.fx.runs_started().is_empty());
+        assert_eq!(r.fx.count(&Call::StopPlay(Channel::Announce)), 1);
+        assert_eq!(r.fx.duck(), Some(false));
+    }
+
+    #[test]
+    fn start_with_the_mic_off_leaves_the_ring() {
+        let (mut r, _) = Rig::ringing();
+        r.d.set_mic_enabled(false, &mut r.fx);
+        r.clear();
+        assert!(!r.start("alice"));
+        assert!(r.d.timer_ringing);
+        assert!(r.fx.calls.is_empty());
     }
 }

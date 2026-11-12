@@ -1,18 +1,19 @@
 use log::{debug, info, warn};
 use max_core::audio::{apply_gain, gain_from_db};
-use max_core::dialog::{Channel, Dialog, Effects, PlayId, Timer, Va};
-use std::path::PathBuf;
-
-use max_core::dialog::Phase;
-use max_core::media::{self, AlertQueue, MediaAction, MediaCmd, MediaRequest, Shown};
+use max_core::dialog::{Channel, Dialog, Effects, HaTimerEvent, PlayId, Sounds, Timer, Va};
+use max_core::input::{InputAction, Keypad, Press};
+use max_core::media::{self, MediaAction, MediaCmd, MediaRequest, Shown};
+use max_core::mic::Mics;
 use max_core::player_proto::{PlayState, PlayerEvent};
 use pulsar_core::Timers;
 use pulsar_esphome::{
-    AnnounceRequest, ApiEvent, ApiHandle, MediaCommand, MediaCommandRequest, MediaState, NumberId,
-    SelectId, SwitchId, TimerEvent, UpdateState, VaEvent,
+    AnnounceRequest, ApiEvent, ApiHandle, BinarySensorId, EventId, MediaCommand,
+    MediaCommandRequest, MediaState, NumberId, SelectId, SwitchId, TimerEvent, UpdateState,
+    VaEvent,
 };
 use pulsar_lan::mdns::MdnsHandle;
 
+use crate::input::InputEvent;
 use crate::player::PlayerHandle;
 use crate::{ESPHOME_SERVICE, VERSION};
 
@@ -28,21 +29,26 @@ pub enum Flow {
     Exit,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tick {
+    Dialog(Timer),
+    Keypad,
+}
+
 pub struct Controller {
     dialog: Dialog,
     fx: Fx,
     mdns: Option<MdnsHandle>,
     mic_gain_db: u32,
     followup_s: u32,
-    mic_enabled: bool,
-    alerts: AlertQueue,
-    alert_path: PathBuf,
+    mics: Mics,
+    keypad: Keypad,
 }
 
 pub struct Fx {
     api: ApiHandle,
     player: PlayerHandle,
-    pub timers: Timers<Timer>,
+    timers: Timers<Tick>,
     streaming: bool,
     ducked: bool,
     announcing: bool,
@@ -56,10 +62,10 @@ impl Controller {
         api: ApiHandle,
         player: PlayerHandle,
         mdns: Option<MdnsHandle>,
-        alert_path: PathBuf,
+        sounds: Sounds,
     ) -> Self {
         Self {
-            dialog: Dialog::new(DEFAULT_FOLLOWUP_S),
+            dialog: Dialog::new(DEFAULT_FOLLOWUP_S, sounds),
             fx: Fx {
                 api,
                 player,
@@ -74,28 +80,73 @@ impl Controller {
             mdns,
             mic_gain_db: DEFAULT_MIC_GAIN_DB,
             followup_s: DEFAULT_FOLLOWUP_S,
-            mic_enabled: true,
-            alerts: AlertQueue::default(),
-            alert_path,
+            mics: Mics::default(),
+            keypad: Keypad::new(),
         }
     }
 
-    pub fn after_event(&mut self) {
-        let free = self.dialog.phase() == Phase::Idle && !self.dialog.announcing();
-        if self.alerts.take_if_free(free) {
-            let path = self.alert_path.to_string_lossy().into_owned();
-            self.dialog.on_media_announce(path, &mut self.fx);
-        }
-    }
-
-    pub fn timers(&mut self) -> &mut Timers<Timer> {
+    pub fn timers(&mut self) -> &mut Timers<Tick> {
         &mut self.fx.timers
+    }
+
+    pub fn on_input(&mut self, ev: InputEvent) {
+        match ev {
+            InputEvent::Opened => {
+                self.keypad.reset();
+                self.on_input_action(None);
+            }
+            InputEvent::Key { ev, at_ms } => {
+                let action = self.keypad.on_event(ev, at_ms);
+                self.on_input_action(action);
+            }
+            InputEvent::MicMutedState(muted) => self.set_hw_muted(muted),
+        }
+    }
+
+    fn on_input_action(&mut self, action: Option<InputAction>) {
+        match action {
+            Some(InputAction::Action(Press::Short)) => {
+                self.fx.api.fire_event(EventId::Button, "action");
+                self.dialog.button(&mut self.fx);
+            }
+            Some(InputAction::Action(Press::Long)) => {
+                self.fx.api.fire_event(EventId::Button, "action_long");
+            }
+            Some(InputAction::MicMuted(muted)) => self.set_hw_muted(muted),
+            None => {}
+        }
+        match self.keypad.deadline() {
+            Some(at) => {
+                let delay = u64::try_from(at - pulsar_core::now_ms()).unwrap_or(0);
+                self.fx.timers.set(Tick::Keypad, delay);
+            }
+            None => self.fx.timers.cancel(Tick::Keypad),
+        }
+    }
+
+    fn set_hw_muted(&mut self, muted: bool) {
+        if self.mics.hw_muted() != muted {
+            info!("microphone switch: {}", if muted { "off" } else { "on" });
+        }
+        self.mics.set_hw(muted);
+        self.fx
+            .api
+            .publish_binary_sensor(BinarySensorId::HwMicMute, muted);
+        self.apply_mics();
+    }
+
+    /// HA sees the actual state, not its own command: "on" under the hardware mute stays off.
+    fn apply_mics(&mut self) {
+        let on = !self.mics.muted();
+        self.fx.api.publish_switch(SwitchId::Microphones, on);
+        self.dialog.set_mic_enabled(on, &mut self.fx);
     }
 
     pub fn publish_all(&self) {
         let api = &self.fx.api;
         self.fx.publish_media();
-        api.publish_switch(SwitchId::Microphones, self.mic_enabled);
+        api.publish_switch(SwitchId::Microphones, !self.mics.muted());
+        api.publish_binary_sensor(BinarySensorId::HwMicMute, self.mics.hw_muted());
         api.publish_switch(SwitchId::AutoUpdate, false);
         api.publish_switch(SwitchId::NearestAnswers, false);
         api.publish_switch(SwitchId::VoiceIndication, true);
@@ -115,8 +166,14 @@ impl Controller {
         });
     }
 
-    pub fn on_timer(&mut self, t: Timer) {
-        self.dialog.on_timer(t, &mut self.fx);
+    pub fn on_timer(&mut self, t: Tick) {
+        match t {
+            Tick::Dialog(t) => self.dialog.on_timer(t, &mut self.fx),
+            Tick::Keypad => {
+                let action = self.keypad.on_tick(pulsar_core::now_ms());
+                self.on_input_action(action);
+            }
+        }
     }
 
     pub fn on_audio(&mut self, mut chunk: Vec<i16>) {
@@ -169,9 +226,17 @@ impl Controller {
                     m.set_txt(ESPHOME_SERVICE, txt);
                 }
             }
-            ApiEvent::Timer(t) if t.event == TimerEvent::Finished => {
-                info!("timer '{}' finished", t.name);
-                self.alerts.request();
+            ApiEvent::Timer(t) => {
+                if t.event == TimerEvent::Finished {
+                    info!("timer '{}' finished", t.name);
+                }
+                let ev = match t.event {
+                    TimerEvent::Started => HaTimerEvent::Started,
+                    TimerEvent::Updated => HaTimerEvent::Updated,
+                    TimerEvent::Cancelled => HaTimerEvent::Cancelled,
+                    TimerEvent::Finished => HaTimerEvent::Finished,
+                };
+                self.dialog.on_ha_timer(ev, &mut self.fx);
             }
             ApiEvent::Restart => return Flow::Exit,
             other => debug!("api: {other:?}"),
@@ -210,8 +275,9 @@ impl Controller {
 
     fn on_switch(&mut self, id: SwitchId, on: bool) {
         if id == SwitchId::Microphones {
-            self.mic_enabled = on;
-            self.dialog.set_mic_enabled(on, &mut self.fx);
+            self.mics.set_switch(on);
+            self.apply_mics();
+            return;
         }
         self.fx.api.publish_switch(id, on);
     }
@@ -294,11 +360,11 @@ impl Effects for Fx {
     }
 
     fn arm(&mut self, timer: Timer, ms: u64) {
-        self.timers.set(timer, ms);
+        self.timers.set(Tick::Dialog(timer), ms);
     }
 
     fn cancel(&mut self, timer: Timer) {
-        self.timers.cancel(timer);
+        self.timers.cancel(Tick::Dialog(timer));
     }
 
     fn set_duck(&mut self, on: bool) {

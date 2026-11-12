@@ -74,6 +74,23 @@
   1200 байт. `io.sdk` рисует часы прямо в `fb4` (содержимое меняется раз в минуту) и держит `fb4`,
   `fb5`, `/dev/input/event{0,2,3}` и `/dev/lp_uart` открытыми.
 
+## Кнопки и микрофоны
+
+- `/dev/input/event0` (`gpio_keypad`): кнопка Алисы `KEY_VOICECOMMAND` (582) — нажатие 1,
+  отпускание 0, автоповтора нет; переключатель микрофонов `SW_MUTE_DEVICE` (14): 1 — выключены,
+  0 — включены. Красную индикацию выключенных микрофонов даёт не `io.sdk`: она есть и при захвате
+  устройства.
+- `/dev/input/event2` (`rotary-volume`): щелчок крутилки — `KEY_PAGEUP` (громче) или
+  `KEY_PAGEDOWN` (тише), нажатие и отпускание с одной меткой времени. `io.sdk` сам меняет
+  `STREAM_MUSIC` и показывает громкость на кольце, в том числе без микрофона.
+- `/dev/input/event3`: `SW_HEADPHONE_INSERT`.
+- `io.sdk` реагирует на кнопку Алисы и без микрофона (фиолетовое кольцо, «Привет, это Алиса»).
+  Под `EVIOCGRAB` на `event0` реакции нет, события получает только захватчик; монопольно никто
+  устройства не держит.
+- Кольцо видно и как sysfs-светодиоды `station2:{red,green,blue}:ring1..24`.
+- Звуки стока: `/data/data/com.yandex.io.sdk/files/system/sounds/common/` (`spotter_start.ogg`,
+  `spotter_cancel.ogg`, `error.wav`, `timer.wav`, `volume_change.wav` и др.).
+
 ## Проверено
 
 - Захват 16 каналов с VQE из своего процесса, раскладка каналов (тон и речь), 12 ноября 2026.
@@ -84,6 +101,12 @@
   через `IAudioService.getStreamVolume`. Без поддельного `ActivityThread`: с ним `MediaPlayer`
   запускает поток субтитров, которому нужен настоящий `Context`, и процесс падает.
 - Демон с обоими помощниками: микрофон забирается при старте и возвращается при SIGTERM.
+- Коды `gpio_keypad` и `rotary-volume`, `EVIOCGRAB` на `event0` (`probes/c/evgrab.c`), 12 ноября
+  2026.
+- Демон с HA, 13 ноября 2026: кнопка Алисы начинает диалог (звук `spotter_start.ogg`), повторное
+  нажатие отменяет его (`spotter_cancel.ogg`); при выключенных кнопкой микрофонах диалог не
+  начинается, в HA «Microphones» выключен и «Hardware mic mute» включён; таймер HA на 10 с
+  звонит повтором `timer.wav` и останавливается кнопкой. `io.sdk` на кнопку не реагирует.
 - С Home Assistant 2026.11.1 (12 ноября 2026): добавление через ESPHome с выдачей ключа Noise,
   `assist_satellite.announce` (TTS по HTTP, FLAC через `tts_proxy`),
   `assist_satellite.start_conversation`: вопрос с 1-2 м распознан, ответ проигран. От конца
@@ -94,6 +117,8 @@
 - HTTPS-URL в `MediaPlayer` и установка `STREAM_MUSIC` через `IAudioService.setStreamVolume`
   (громкость из HA).
 - Вывод через AAudio из нативного процесса и `libquasar_gstreamer.so` из APK.
-- Кнопки и крутилка громкости, датчик освещённости.
+- Звук ошибки диалога (`error.wav`).
+- Видит ли демон громкость, изменённую крутилкой (событие `volume` от плеера).
+- Датчик освещённости.
 - Zigbee (EZSP на `/dev/lp_uart`).
 - Автозапуск из `/odm/etc/init`.

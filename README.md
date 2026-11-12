@@ -13,8 +13,9 @@ pulsar поддерживает Buildroot-станции (Миди, Лайт 2, 
 
 В разработке. С Home Assistant на станции работают: обнаружение и подключение через ESPHome,
 объявления (`assist_satellite.announce`) и диалог, начатый из HA
-(`assist_satellite.start_conversation`): вопрос распознаётся, ответ звучит со станции. Ключевого
-слова на станции, автозапуска и кнопок пока нет. План —
+(`assist_satellite.start_conversation`): вопрос распознаётся, ответ звучит со станции. Кнопка
+Алисы начинает и отменяет диалог со звуками стока, кнопка микрофонов его запрещает, таймеры HA
+звонят и останавливаются кнопкой. Ключевого слова на станции и автозапуска пока нет. План —
 [docs/architecture.md](docs/architecture.md#этапы).
 
 ## Требования
@@ -41,7 +42,7 @@ make check                            # fmt, clippy -D warnings, тесты max-
 | `crates/max-core` | логика без ввода-вывода: диалог, децимация 48 → 16 кГц, протокол помощников, медиа; тестируется на хосте |
 | `android/helper` | помощники на Java (`app_process`): захват `AudioRecord` и плеер `MediaPlayer` |
 | `third_party/pulsar-lan` | `pulsar-lan` с исправлением сборки под Android ([README](third_party/README.md)) |
-| `probes/` | пробы железа: захват звука (Java через `app_process`), разбор записи |
+| `probes/` | пробы железа: захват звука (Java через `app_process`), разбор записи, захват кнопок (`c/evgrab.c`, NDK) |
 | `docs/` | факты о станции и архитектура |
 
 ## Лицензия

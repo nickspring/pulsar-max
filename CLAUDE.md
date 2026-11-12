@@ -20,6 +20,7 @@ make check                # cargo fmt --check, clippy -D warnings (Android targe
 make test                 # cargo test -p max-core (host)
 cargo --locked test -p max-core identity::tests::name_from_sysfs_line   # single test
 probes/java/build.sh      # Java probe -> probes/java/build/classes.dex (JDK 17, SDK android-33, d8)
+probes/c/build.sh         # C probes (NDK clang) -> probes/c/build/; evgrab <dev> <sec> tests EVIOCGRAB
 python3 -I probes/analyze_capture.py <file.raw> 16 [rate] [tone_hz] ["a-b,c-d"]   # per-channel levels
 ```
 
@@ -74,7 +75,13 @@ and restore it as above.
 - **Dialog.** `max-core/src/dialog.rs` is pulsar's voice logic as a pure state machine over the
   `Effects` trait; `crates/pulsar-max/src/controller.rs` implements `Effects` over pulsar-esphome
   and the player. Runs start from HA (`assist_satellite.start_conversation`, announcements);
-  pulsar-esphome hardcodes flags=0, so HA-side wake word is not available.
+  pulsar-esphome hardcodes flags=0, so HA-side wake word is not available. The action button
+  starts runs too. Earcons and the HA timer ring play io.sdk's own sound files in place
+  (`Sounds`, built in main.rs), the timer falling back to a generated `timer_alert.wav`.
+- **Buttons.** `crates/pulsar-max/src/input.rs` EVIOCGRABs `gpio_keypad` (io.sdk would answer the
+  action button too); `max-core/src/input.rs` decodes events and classifies presses (pulsar-hw
+  timing; presses are timed in the reader thread). The knob stays with io.sdk, which drives
+  `STREAM_MUSIC` itself. evgrab fails with EBUSY while the daemon holds the grab.
 - **Coexistence with the Yandex stack.** `com.yandex.io.sdk` cannot be disabled (protected
   package) or force-stopped (bound by system apps). The daemon takes the mic with
   `cmd appops set com.yandex.io.sdk RECORD_AUDIO ignore` + `kill` of its process; Android 9 allows
