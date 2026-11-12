@@ -19,9 +19,9 @@ export PULSAR_MAX_BUILD_TIME := $(shell LC_ALL=C git log -1 --format=%cd --date=
 CARGO_ANDROID := cargo --locked
 BIN := target/$(TARGET)/release/pulsar-max
 
-.PHONY: all check fmt clippy test clean ndk
+.PHONY: all check fmt clippy test test-helper clean ndk
 
-all: build/pulsar-max
+all: build/pulsar-max build/helper.dex
 
 ndk:
 	@test -x "$(CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER)" || { echo "NDK not found: set NDK=<path>"; exit 1; }
@@ -32,7 +32,12 @@ build/pulsar-max: ndk FORCE
 	$(NDK_BIN)/llvm-strip -o $@ $(BIN)
 	cp $(BIN) build/pulsar-max.debug
 
-check: fmt clippy test
+build/helper.dex: android/helper/build.sh $(wildcard android/helper/*.java android/helper/test/*.java)
+	android/helper/build.sh
+	@mkdir -p build
+	cp android/helper/build/helper.dex $@
+
+check: fmt clippy test test-helper
 
 fmt:
 	cargo fmt --all --check
@@ -44,8 +49,12 @@ clippy: ndk
 test:
 	$(CARGO_ANDROID) test -p max-core
 
+# build.sh runs the helper's host tests before it builds the dex.
+test-helper:
+	android/helper/build.sh
+
 clean:
 	cargo clean
-	rm -rf build
+	rm -rf build android/helper/build
 
 FORCE:

@@ -80,9 +80,19 @@
 - Воспроизведение `AudioTrack` (тон амплитудой 0.05 при громкости 20/100).
 - Запись в `fb5` и `fb4` видна на станции.
 - Отбор микрофона у `io.sdk` через appops и возврат.
+- `MediaPlayer` из root `app_process`: локальный WAV доигрывает до конца; чтение `STREAM_MUSIC`
+  через `IAudioService.getStreamVolume`. Без поддельного `ActivityThread`: с ним `MediaPlayer`
+  запускает поток субтитров, которому нужен настоящий `Context`, и процесс падает.
+- Демон с обоими помощниками: микрофон забирается при старте и возвращается при SIGTERM.
+- С Home Assistant 2026.11.1 (12 ноября 2026): добавление через ESPHome с выдачей ключа Noise,
+  `assist_satellite.announce` (TTS по HTTP, FLAC через `tts_proxy`),
+  `assist_satellite.start_conversation`: вопрос с 1-2 м распознан, ответ проигран. От конца
+  речи (`STT_VAD_END`) до конца обработки (`RUN_END`) — 0.8 с.
 
 ## Не проверено
 
+- HTTPS-URL в `MediaPlayer` и установка `STREAM_MUSIC` через `IAudioService.setStreamVolume`
+  (громкость из HA).
 - Вывод через AAudio из нативного процесса и `libquasar_gstreamer.so` из APK.
 - Кнопки и крутилка громкости, датчик освещённости.
 - Zigbee (EZSP на `/dev/lp_uart`).

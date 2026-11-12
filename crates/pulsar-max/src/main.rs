@@ -4,23 +4,32 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 
+mod capture;
+mod controller;
+mod helper;
+mod player;
 #[allow(unsafe_code)]
 mod sys;
+mod yandex;
 
 use std::ffi::OsStr;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use log::{error, info, warn};
 use max_core::identity::{self, FRIENDLY_NAME, MANUFACTURER, MODEL_NAME, PLATFORM};
 use pulsar_core::actors;
-use pulsar_esphome::{ApiConfig, ApiEvent, DeviceIdentity};
+use pulsar_esphome::{ApiConfig, DeviceIdentity};
 use pulsar_lan::mdns::{self, MdnsService};
-use tokio::signal::unix::{SignalKind, signal};
+use tokio::signal::unix::{Signal, SignalKind, signal};
 
-const VERSION: &str = match option_env!("PULSAR_MAX_VERSION") {
+use controller::{Controller, Flow, MUSIC_STYLES};
+
+pub(crate) const VERSION: &str = match option_env!("PULSAR_MAX_VERSION") {
     Some(v) => v,
     None => "unknown",
 };
@@ -30,7 +39,9 @@ const BUILD_TIME: &str = match option_env!("PULSAR_MAX_BUILD_TIME") {
 };
 const DEFAULT_DATA_DIR: &str = "/data/pulsar-max";
 const API_PORT: u16 = 6053;
-const ESPHOME_SERVICE: &str = "_esphomelib._tcp";
+pub(crate) const ESPHOME_SERVICE: &str = "_esphomelib._tcp";
+const ALERT_FILE: &str = "timer_alert.wav";
+const TEARDOWN_SECS: u64 = 5;
 
 fn main() -> ExitCode {
     let arg = std::env::args_os().nth(1);
@@ -96,6 +107,7 @@ async fn run(data_dir: &Path) -> u8 {
     let name = id.name.clone();
     let cfg = ApiConfig {
         port: API_PORT,
+        music_styles: MUSIC_STYLES.iter().map(|s| (*s).to_owned()).collect(),
         has_clock: false,
         has_lux: false,
         has_hw_mic_mute: false,
@@ -104,7 +116,7 @@ async fn run(data_dir: &Path) -> u8 {
         key_path: Some(data_dir.join("api.key")),
         ..ApiConfig::default()
     };
-    let Ok((api, mut events)) = pulsar_esphome::spawn(id, cfg) else {
+    let Ok((api, mut api_events)) = pulsar_esphome::spawn(id, cfg) else {
         return 1;
     };
     let mdns = match mdns::spawn(name.clone()) {
@@ -122,31 +134,79 @@ async fn run(data_dir: &Path) -> u8 {
             None
         }
     };
-    let (mut term, mut int) = match (
-        signal(SignalKind::terminate()),
-        signal(SignalKind::interrupt()),
-    ) {
-        (Ok(t), Ok(i)) => (t, i),
-        (Err(e), _) | (_, Err(e)) => {
-            error!("signal handler: {e}");
-            return 1;
+    let mut signals = Vec::new();
+    for kind in [
+        SignalKind::terminate(),
+        SignalKind::interrupt(),
+        SignalKind::hangup(),
+        SignalKind::quit(),
+    ] {
+        match signal(kind) {
+            Ok(s) => signals.push(s),
+            Err(e) => {
+                error!("signal handler: {e}");
+                return 1;
+            }
         }
+    }
+    let Ok([mut term, mut int, mut hup, mut quit]) = <[Signal; 4]>::try_from(signals) else {
+        return 1;
     };
+
+    let dex = helper::dex_path();
+    let alert = data_dir.join(ALERT_FILE);
+    if let Err(e) = std::fs::write(&alert, max_core::media::alert_wav()) {
+        warn!("{}: {e}", alert.display());
+    }
+    let (player, mut player_events) = player::spawn(dex.clone());
+    let mic_taken = yandex::take_mic();
+    let (capture, mut audio) = capture::spawn(dex);
+    let mut ctl = Controller::new(api, player, mdns, alert);
+    ctl.publish_all();
     info!("pulsar-max {VERSION} running as {name}");
 
     loop {
         tokio::select! {
-            ev = events.recv() => match ev {
-                None | Some(ApiEvent::Restart) => return 0,
-                Some(ApiEvent::MdnsTxtChanged(txt)) => {
-                    if let Some(m) = &mdns {
-                        m.set_txt(ESPHOME_SERVICE, txt);
-                    }
+            biased;
+            t = ctl.timers().next() => ctl.on_timer(t),
+            Some(ev) = api_events.recv() => {
+                if let Flow::Exit = ctl.on_api(ev) {
+                    break;
                 }
-                Some(ev) => info!("api: {ev:?}"),
-            },
-            _ = term.recv() => return 0,
-            _ = int.recv() => return 0,
+            }
+            Some(ev) = player_events.recv() => ctl.on_player(ev),
+            Some(chunk) = audio.recv() => ctl.on_audio(chunk),
+            _ = term.recv() => break,
+            _ = int.recv() => break,
+            _ = hup.recv() => break,
+            _ = quit.recv() => break,
         }
+        ctl.after_event();
+    }
+    let restored = Arc::new(AtomicBool::new(!mic_taken));
+    arm_teardown_watchdog(restored.clone());
+    drop(capture);
+    if mic_taken {
+        yandex::give_back_mic();
+        restored.store(true, Ordering::Relaxed);
+    }
+    0
+}
+
+/// pulsar's teardown watchdog; here it also returns the microphone to io.sdk, which a hung
+/// teardown would otherwise leave deaf.
+fn arm_teardown_watchdog(mic_restored: Arc<AtomicBool>) {
+    let spawned = std::thread::Builder::new()
+        .name("teardown-wd".into())
+        .spawn(move || {
+            std::thread::sleep(Duration::from_secs(TEARDOWN_SECS));
+            error!("teardown did not finish in {TEARDOWN_SECS} s, exiting");
+            if !mic_restored.load(Ordering::Relaxed) {
+                yandex::give_back_mic();
+            }
+            sys::exit_now(0);
+        });
+    if let Err(e) = spawned {
+        error!("teardown watchdog: {e}");
     }
 }

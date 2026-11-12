@@ -1,6 +1,7 @@
 /target/
 /build/
 /probes/java/build/
+/android/helper/build/
 *.dex
 
 # Proprietary firmware copies and station recordings stay local.

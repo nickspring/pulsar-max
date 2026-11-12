@@ -11,8 +11,11 @@ pulsar поддерживает Buildroot-станции (Миди, Лайт 2, 
 
 ## Статус
 
-Ранний каркас. Работает: демон на станции, ESPHome API на порту 6053 и mDNS-объявление
-`yandex-max-xxxxxx`. План — [docs/architecture.md](docs/architecture.md#этапы).
+В разработке. С Home Assistant на станции работают: обнаружение и подключение через ESPHome,
+объявления (`assist_satellite.announce`) и диалог, начатый из HA
+(`assist_satellite.start_conversation`): вопрос распознаётся, ответ звучит со станции. Ключевого
+слова на станции, автозапуска и кнопок пока нет. План —
+[docs/architecture.md](docs/architecture.md#этапы).
 
 ## Требования
 
@@ -24,7 +27,9 @@ pulsar поддерживает Buildroot-станции (Миди, Лайт 2, 
 ```sh
 brew install rustup                   # тулчейн берётся из rust-toolchain.toml
 brew install --cask android-ndk       # или NDK=<путь> для make
-make                                  # build/pulsar-max (aarch64-linux-android, API 28)
+# помощники: JDK 17 и Android SDK (platforms/android-33, build-tools/36.0.0) в ANDROID_HOME
+# или ~/Library/Android/sdk
+make                                  # build/pulsar-max (aarch64-linux-android, API 28) и build/helper.dex
 make check                            # fmt, clippy -D warnings, тесты max-core на хосте
 ```
 
@@ -32,8 +37,9 @@ make check                            # fmt, clippy -D warnings, тесты max-
 
 | Путь | Что |
 |---|---|
-| `crates/pulsar-max` | демон: запуск, ESPHome API, mDNS |
-| `crates/max-core` | логика без ввода-вывода, тестируется на хосте |
+| `crates/pulsar-max` | демон: ESPHome API, mDNS, контроллер, процессы-помощники, отбор микрофона у `io.sdk` |
+| `crates/max-core` | логика без ввода-вывода: диалог, децимация 48 → 16 кГц, протокол помощников, медиа; тестируется на хосте |
+| `android/helper` | помощники на Java (`app_process`): захват `AudioRecord` и плеер `MediaPlayer` |
 | `third_party/pulsar-lan` | `pulsar-lan` с исправлением сборки под Android ([README](third_party/README.md)) |
 | `probes/` | пробы железа: захват звука (Java через `app_process`), разбор записи |
 | `docs/` | факты о станции и архитектура |

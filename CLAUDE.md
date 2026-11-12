@@ -14,7 +14,8 @@ Homebrew `rustup` is keg-only; the Makefile puts `/opt/homebrew/opt/rustup/bin` 
 SDK); override with `make NDK=<path>`.
 
 ```sh
-make                      # build/pulsar-max (stripped) + build/pulsar-max.debug, aarch64-linux-android API 28
+make                      # build/pulsar-max (+ .debug, aarch64-linux-android API 28) and build/helper.dex
+                          # (helpers need JDK 17 and the Android SDK: platforms/android-33, build-tools/36.0.0)
 make check                # cargo fmt --check, clippy -D warnings (Android target + max-core on host), tests
 make test                 # cargo test -p max-core (host)
 cargo --locked test -p max-core identity::tests::name_from_sysfs_line   # single test
@@ -25,21 +26,26 @@ python3 -I probes/analyze_capture.py <file.raw> 16 [rate] [tone_hz] ["a-b,c-d"] 
 `cargo --locked` is used everywhere: commit `Cargo.lock` changes deliberately.
 
 Running on the station (root ssh on port 2222; absshd has no scp/sftp, so files go through
-`cat`). Everything stays in `/data/local/tmp/pulsar-max/` and is removed afterwards:
+`cat`). Everything stays in `/data/local/tmp/pulsar-max/` and is removed afterwards. The daemon
+takes the mic from io.sdk at start and gives it back on SIGTERM/SIGINT/SIGHUP/SIGQUIT or HA
+Restart; run it with `ssh -t` so Ctrl-C arrives, and always end with the restore line, which is
+harmless when nothing was taken:
 
 ```sh
 st() { ssh -p 2222 root@<station> "$@"; }; T=/data/local/tmp/pulsar-max
 st "mkdir -p $T"
 st "cat > $T/pulsar-max && chmod 755 $T/pulsar-max" < build/pulsar-max
-st "$T/pulsar-max $T/data"                       # daemon with a throwaway data dir
+st "cat > $T/helper.dex" < build/helper.dex     # found next to the binary
+ssh -t -p 2222 root@<station> "$T/pulsar-max $T/data"   # Ctrl-C to stop
 st "cat > $T/probe.dex" < probes/java/build/classes.dex
 st "CLASSPATH=$T/probe.dex app_process /system/bin MaxProbe record 8 $T/out.raw ffff 1 0.05"
 st "cat $T/out.raw" > out.raw                    # binary only on this stream
+st 'cmd appops set com.yandex.io.sdk RECORD_AUDIO allow; kill $(pidof com.yandex.io.sdk)'
 st "rm -rf $T"
 ```
 
-The capture probe fails while io.sdk records; take the mic first and give it back afterwards
-(see Rules).
+The capture probe fails while io.sdk records; take the mic first (`RECORD_AUDIO ignore` + kill)
+and restore it as above.
 
 ## Architecture
 
@@ -57,12 +63,18 @@ The capture probe fails while io.sdk records; take the mic first and give it bac
   `pulsar_core::actors` returning non-blocking `Clone` handles plus event receivers; blocking or
   realtime loops run on named `std::thread`s; `unsafe` and libc only in `sys.rs` with
   `// SAFETY:` (enforced by `#![deny(clippy::undocumented_unsafe_blocks)]`).
-- **Audio path (planned, proven by probes).** The HAL is owned by `audioserver`; Yandex VQE runs
-  there as a preprocessing effect for source `MIC`. Capture is Java `AudioRecord` with
-  `setChannelIndexMask(0xffff)` from a root `app_process` (needs a fake `ActivityThread` /
-  `opPackageName`, see `probes/java/MaxProbe.java`); AAudio caps at 8 channels on Android 9.
-  Channel 1 is `vqe_0` (the ASR channel), 0 is the same ×30, 3-10 raw mics, 13-14 speaker
-  reference (full table in `docs/max.md`).
+- **Helpers.** The HAL is owned by `audioserver`; Yandex VQE runs there as a preprocessing
+  effect for source `MIC`. `android/helper/MaxHelper.java` runs as root under `app_process` in two
+  processes: `capture` (`AudioRecord` with `setChannelIndexMask(0xffff)`, needs a fake
+  `ActivityThread`/`opPackageName`; streams channel 1 = `vqe_0`) and `player` (`MediaPlayer` per
+  channel, `STREAM_MUSIC` through reflected `IAudioService`). The line protocol is in
+  docs/architecture.md, "Протокол помощников"; its Rust side is `max-core/src/player_proto.rs`.
+  `crates/pulsar-max/src/{capture,player}.rs` spawn and restart them; `max-core` decimates
+  48 -> 16 kHz and keeps the exactly-one-`done`-per-play bookkeeping (`inflight.rs`).
+- **Dialog.** `max-core/src/dialog.rs` is pulsar's voice logic as a pure state machine over the
+  `Effects` trait; `crates/pulsar-max/src/controller.rs` implements `Effects` over pulsar-esphome
+  and the player. Runs start from HA (`assist_satellite.start_conversation`, announcements);
+  pulsar-esphome hardcodes flags=0, so HA-side wake word is not available.
 - **Coexistence with the Yandex stack.** `com.yandex.io.sdk` cannot be disabled (protected
   package) or force-stopped (bound by system apps). The daemon takes the mic with
   `cmd appops set com.yandex.io.sdk RECORD_AUDIO ignore` + `kill` of its process; Android 9 allows

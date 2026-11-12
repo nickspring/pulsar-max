@@ -2,4 +2,11 @@
 //! logic has to be tested on the host.
 #![forbid(unsafe_code)]
 
+pub mod audio;
+pub mod backoff;
+pub mod dialog;
 pub mod identity;
+pub mod inflight;
+pub mod media;
+pub mod pcm;
+pub mod player_proto;
