@@ -1,5 +1,9 @@
 use std::collections::HashMap;
 
+use crate::commands::{
+    COMMAND_AFTER_WAKE_MS, MusicAction, VoiceCommand, command_allowed, stt_stop,
+};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Va {
     Error,
@@ -57,6 +61,7 @@ pub enum Timer {
     RingTimeout,
     /// pulsar's `UiAfterNotSubscribed`: the ring gets the real state back.
     ErrorShown,
+    CommandWindow,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,6 +79,8 @@ pub struct Sounds {
     pub cancel: Option<String>,
     pub error: Option<String>,
     pub timer: Option<String>,
+    /// The click after a voice volume step; Dialog itself never plays it.
+    pub volume: Option<String>,
 }
 
 pub const LISTEN_TIMEOUT_MS: u64 = 30_000;
@@ -102,6 +109,19 @@ pub trait Effects {
     fn set_announcing(&mut self, on: bool);
     /// pulsar's ring holds `Error` for its own time and keeps it over a following `Idle`.
     fn show(&mut self, ui: Ui);
+    fn music(&mut self, action: MusicAction);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommandOutcome {
+    Done,
+    /// Within the window after a run start: the run was ended first.
+    AfterWake,
+    /// "стоп" in a dialog past the window.
+    InDialog,
+    PartOfRequest,
+    NotForThisStation,
+    MicOff,
 }
 
 /// Pipeline events carry no run id. HA ends a run it replaces with a RUN_END sent before the new
@@ -227,6 +247,10 @@ pub struct Dialog {
     shown: Ui,
     /// pulsar's `error_shown`: the failed dialog's later states stay off the ring.
     error_shown: bool,
+    /// pulsar's `now - listen_started_ms < COMMAND_AFTER_WAKE_MS`.
+    command_window: bool,
+    wake_dialog: bool,
+    ring_stopped_in_dialog: bool,
 }
 
 impl Dialog {
@@ -256,6 +280,9 @@ impl Dialog {
             ring_cycle: 0,
             shown: Ui::Idle,
             error_shown: false,
+            command_window: false,
+            wake_dialog: false,
+            ring_stopped_in_dialog: false,
         }
     }
 
@@ -292,6 +319,7 @@ impl Dialog {
     /// While the timer rings this only stops the ring: the wake word is a stop word then.
     pub fn start(&mut self, phrase: &str, fx: &mut impl Effects) -> bool {
         let started = if self.timer_ringing && self.mic_enabled {
+            self.ring_stopped_in_dialog = self.in_run();
             self.stop_timer_ring(fx);
             false
         } else {
@@ -339,6 +367,7 @@ impl Dialog {
                 }
             }
             Va::SttVadStart => fx.cancel(Timer::FollowupWait),
+            Va::SttEnd if self.in_run() && stt_stop(get("text")) => self.stt_stop_word(fx),
             Va::SttVadEnd | Va::SttEnd => self.stop_streaming(fx),
             Va::IntentStart => {
                 if self.phase == Phase::Listening {
@@ -522,8 +551,105 @@ impl Dialog {
             }
             Timer::RingTimeout => self.ring_expired = self.timer_ringing,
             Timer::ErrorShown => self.error_shown = false,
+            Timer::CommandWindow => self.command_window = false,
         }
         self.update_ui(fx);
+    }
+
+    /// A word of the command spotter. pulsar's arbitration paths are left out: there is no
+    /// arbiter here.
+    pub fn command(
+        &mut self,
+        c: VoiceCommand,
+        owns_music: bool,
+        fx: &mut impl Effects,
+    ) -> CommandOutcome {
+        if !self.mic_enabled {
+            return CommandOutcome::MicOff;
+        }
+        let after_wake = self.after_wake();
+        let in_dialog = self.in_run() && !after_wake;
+        let sounding = self.phase == Phase::Speaking || self.announcing || self.timer_ringing;
+        if !command_allowed(c, after_wake, in_dialog, sounding, owns_music) {
+            return if in_dialog {
+                CommandOutcome::PartOfRequest
+            } else {
+                CommandOutcome::NotForThisStation
+            };
+        }
+        if after_wake {
+            self.end_interaction(fx);
+        }
+        match c {
+            VoiceCommand::Stop => self.stop_word(in_dialog, fx),
+            VoiceCommand::Pause => fx.music(MusicAction::Pause),
+            VoiceCommand::Resume => fx.music(MusicAction::Resume),
+            VoiceCommand::Louder | VoiceCommand::Quieter => fx.music(MusicAction::Volume {
+                up: c == VoiceCommand::Louder,
+                click: self.volume_click_allowed(),
+            }),
+            VoiceCommand::Next => fx.music(MusicAction::Next),
+            VoiceCommand::Prev => fx.music(MusicAction::Prev),
+        }
+        self.update_ui(fx);
+        if after_wake {
+            CommandOutcome::AfterWake
+        } else if in_dialog {
+            CommandOutcome::InDialog
+        } else {
+            CommandOutcome::Done
+        }
+    }
+
+    /// The click shares ANNOUNCE with speech, earcons and the ring, and would cut them; while
+    /// listening the mic streams to STT.
+    pub fn volume_click_allowed(&self) -> bool {
+        matches!(self.phase, Phase::Idle | Phase::Processing)
+            && !self.announcing
+            && !self.timer_ringing
+            && !self.closing_earcon
+    }
+
+    fn in_run(&self) -> bool {
+        matches!(self.phase, Phase::Listening | Phase::Processing)
+    }
+
+    fn after_wake(&self) -> bool {
+        self.in_run() && self.command_window
+    }
+
+    fn stop_word(&mut self, in_dialog: bool, fx: &mut impl Effects) {
+        if self.timer_ringing {
+            self.ring_stopped_in_dialog = in_dialog;
+            self.stop_timer_ring(fx);
+        } else if in_dialog {
+            self.cancel_dialog(fx);
+        } else if self.phase == Phase::Speaking {
+            self.interrupt_speech(fx);
+            self.end_interaction(fx);
+        } else if self.announcing {
+            self.interrupt_speech(fx);
+            self.update_duck(fx);
+        } else {
+            // As stock: "стоп" with nothing else to stop pauses the music.
+            fx.music(MusicAction::Pause);
+        }
+    }
+
+    /// The text does not tell when the word was said: after the wake word it is "Алиса, стоп",
+    /// otherwise "стоп" mid-dialog. A ring stopped in this dialog keeps it from pausing music.
+    fn stt_stop_word(&mut self, fx: &mut impl Effects) {
+        if self.wake_dialog {
+            self.end_interaction(fx);
+            if self.timer_ringing || !self.ring_stopped_in_dialog {
+                self.stop_word(false, fx);
+            }
+            return;
+        }
+        if self.timer_ringing {
+            self.stop_timer_ring(fx);
+        }
+        self.cancel_dialog(fx);
     }
 
     fn can_listen(&self, fx: &impl Effects) -> bool {
@@ -565,6 +691,10 @@ impl Dialog {
         self.voice_run = fx.start_run(phrase);
         fx.set_streaming(true);
         self.arm_watchdog(fx);
+        self.wake_dialog = !phrase.is_empty();
+        self.ring_stopped_in_dialog = false;
+        self.command_window = true;
+        fx.arm(Timer::CommandWindow, COMMAND_AFTER_WAKE_MS);
     }
 
     fn is_current_run(&self, run: u64) -> bool {
@@ -805,6 +935,7 @@ mod tests {
         Cancel(Timer),
         Duck(bool),
         Announcing(bool),
+        Music(MusicAction),
     }
 
     struct Fx {
@@ -908,6 +1039,16 @@ mod tests {
         fn last_play(&self) -> PlayId {
             PlayId(self.plays)
         }
+
+        fn music(&self) -> Vec<MusicAction> {
+            self.calls
+                .iter()
+                .filter_map(|c| match c {
+                    Call::Music(a) => Some(*a),
+                    _ => None,
+                })
+                .collect()
+        }
     }
 
     impl Effects for Fx {
@@ -954,6 +1095,9 @@ mod tests {
         fn show(&mut self, ui: Ui) {
             self.shows.push(ui);
         }
+        fn music(&mut self, action: MusicAction) {
+            self.calls.push(Call::Music(action));
+        }
     }
 
     const URL: &str = "http://ha.local/tts/answer.flac";
@@ -985,6 +1129,7 @@ mod tests {
                     cancel: Some(CANCEL.into()),
                     error: Some(ERROR.into()),
                     timer: Some(RING.into()),
+                    volume: None,
                 },
             )
         }
@@ -1032,6 +1177,14 @@ mod tests {
 
         fn ha_timer(&mut self, ev: HaTimerEvent) {
             self.d.on_ha_timer(ev, &mut self.fx);
+        }
+
+        fn cmd(&mut self, c: VoiceCommand, owns_music: bool) -> CommandOutcome {
+            self.d.command(c, owns_music, &mut self.fx)
+        }
+
+        fn stt(&mut self, text: &str) {
+            self.ev(Va::SttEnd, &[("text", text)]);
         }
 
         fn ringing() -> (Self, PlayId) {
@@ -2887,5 +3040,431 @@ mod tests {
         r.clear();
         r.d.on_link_lost(&mut r.fx);
         assert_eq!(r.fx.shows, [Ui::Idle], "Error was shown, so Idle follows");
+    }
+
+    const WORDS: [VoiceCommand; 7] = [
+        VoiceCommand::Stop,
+        VoiceCommand::Pause,
+        VoiceCommand::Resume,
+        VoiceCommand::Louder,
+        VoiceCommand::Quieter,
+        VoiceCommand::Next,
+        VoiceCommand::Prev,
+    ];
+
+    fn action(c: VoiceCommand, click: bool) -> MusicAction {
+        match c {
+            VoiceCommand::Stop | VoiceCommand::Pause => MusicAction::Pause,
+            VoiceCommand::Resume => MusicAction::Resume,
+            VoiceCommand::Louder => MusicAction::Volume { up: true, click },
+            VoiceCommand::Quieter => MusicAction::Volume { up: false, click },
+            VoiceCommand::Next => MusicAction::Next,
+            VoiceCommand::Prev => MusicAction::Prev,
+        }
+    }
+
+    impl Rig {
+        fn woken() -> Self {
+            let mut r = Self::loud();
+            assert!(r.wake("Алиса"));
+            r.ev(Va::RunStart, &[("url", URL)]);
+            r
+        }
+    }
+
+    #[test]
+    fn command_window_opens_at_every_run_start_until_its_timer() {
+        let mut r = Rig::new(5);
+        assert!(!r.d.after_wake());
+        r.timer(Timer::CommandWindow);
+        assert!(r.fx.calls.is_empty());
+        r.run_started();
+        assert_eq!(
+            r.fx.armed(Timer::CommandWindow),
+            Some(COMMAND_AFTER_WAKE_MS)
+        );
+        assert!(r.d.after_wake());
+        r.ev(Va::SttEnd, &[]);
+        assert_eq!(r.phase(), Phase::Processing);
+        assert!(r.d.after_wake());
+        r.timer(Timer::CommandWindow);
+        assert!(!r.d.after_wake());
+        assert_eq!(r.phase(), Phase::Processing);
+
+        let (mut r, tts) = Rig::speaking(5, true);
+        assert!(r.d.command_window);
+        assert!(!r.d.after_wake(), "speaking");
+        r.timer(Timer::CommandWindow);
+        r.done(tts, true);
+        assert_eq!(r.phase(), Phase::Listening);
+        assert!(r.d.after_wake(), "follow-up turn");
+        r.button();
+        assert!(r.d.command_window);
+        assert!(!r.d.after_wake(), "idle");
+
+        let mut r = Rig::new(5);
+        let ann = r.announce(true);
+        r.done(ann, true);
+        assert_eq!(
+            r.fx.armed(Timer::CommandWindow),
+            Some(COMMAND_AFTER_WAKE_MS)
+        );
+        assert!(r.d.after_wake(), "start_conversation");
+    }
+
+    #[test]
+    fn idle_without_own_music_takes_only_stop() {
+        for c in WORDS {
+            let mut r = Rig::new(5);
+            if c == VoiceCommand::Stop {
+                assert_eq!(r.cmd(c, false), CommandOutcome::Done);
+                assert_eq!(r.fx.calls, [Call::Music(MusicAction::Pause)]);
+            } else {
+                assert_eq!(r.cmd(c, false), CommandOutcome::NotForThisStation, "{c:?}");
+                assert!(r.fx.calls.is_empty(), "{c:?}");
+            }
+            assert_eq!(r.phase(), Phase::Idle);
+        }
+    }
+
+    #[test]
+    fn idle_with_own_music_acts_on_every_word_with_a_click() {
+        for c in WORDS {
+            let mut r = Rig::new(5);
+            assert_eq!(r.cmd(c, true), CommandOutcome::Done, "{c:?}");
+            assert_eq!(r.fx.calls, [Call::Music(action(c, true))], "{c:?}");
+            assert!(r.fx.shows.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_word_within_the_window_ends_the_run_first_and_acts_as_in_idle() {
+        for processing in [false, true] {
+            for c in WORDS {
+                let mut r = Rig::woken();
+                if processing {
+                    r.ev(Va::SttEnd, &[]);
+                }
+                r.clear();
+                assert_eq!(r.cmd(c, false), CommandOutcome::AfterWake, "{c:?}");
+                r.assert_ended();
+                assert_eq!(r.fx.stops(), 1);
+                assert!(r.fx.plays().is_empty(), "no cancel earcon");
+                let music = Call::Music(action(c, true));
+                assert_eq!(r.fx.count(&music), 1, "{c:?}");
+                assert!(r.fx.index(&Call::StopRun) < r.fx.index(&music));
+                assert!(r.fx.index(&Call::Duck(false)) < r.fx.index(&music));
+                assert_eq!(r.fx.shows, [Ui::Idle]);
+            }
+        }
+    }
+
+    #[test]
+    fn past_the_window_only_stop_counts_and_cancels_the_dialog() {
+        for processing in [false, true] {
+            for c in WORDS {
+                let mut r = Rig::loud();
+                r.run_started();
+                if processing {
+                    r.ev(Va::SttEnd, &[]);
+                }
+                r.timer(Timer::CommandWindow);
+                let phase = r.phase();
+                r.clear();
+                if c != VoiceCommand::Stop {
+                    assert_eq!(r.cmd(c, true), CommandOutcome::PartOfRequest, "{c:?}");
+                    assert!(r.fx.calls.is_empty(), "{c:?}");
+                    assert_eq!(r.phase(), phase);
+                    continue;
+                }
+                assert_eq!(r.cmd(c, true), CommandOutcome::InDialog);
+                assert_eq!(r.phase(), Phase::Idle);
+                assert_eq!(r.fx.stops(), 1);
+                assert_eq!(r.fx.plays(), vec![sound(CANCEL)]);
+                assert!(r.fx.music().is_empty());
+                assert_eq!(r.fx.duck(), Some(true));
+                let earcon = r.fx.last_play();
+                r.done(earcon, true);
+                assert_eq!(r.fx.duck(), Some(false));
+            }
+        }
+    }
+
+    #[test]
+    fn stop_past_the_window_only_stops_a_ring() {
+        let mut r = Rig::loud();
+        r.run_started();
+        r.timer(Timer::CommandWindow);
+        r.ha_timer(HaTimerEvent::Finished);
+        r.clear();
+        assert_eq!(r.cmd(VoiceCommand::Stop, true), CommandOutcome::InDialog);
+        assert!(!r.d.timer_ringing);
+        assert_eq!(r.phase(), Phase::Listening);
+        assert_eq!(r.fx.stops(), 0);
+        assert!(r.fx.plays().is_empty());
+        assert!(r.fx.music().is_empty());
+        assert_eq!(r.fx.duck(), Some(true));
+    }
+
+    #[test]
+    fn stop_cuts_the_answer_and_leaves_the_music() {
+        let (mut r, tts) = Rig::speaking(5, true);
+        r.clear();
+        assert_eq!(r.cmd(VoiceCommand::Stop, true), CommandOutcome::Done);
+        r.assert_ended();
+        assert_eq!(r.fx.count(&Call::StopPlay(Channel::Announce)), 1);
+        assert_eq!(r.fx.stops(), 1);
+        assert_eq!(r.fx.answers(), vec![false]);
+        assert!(r.fx.music().is_empty());
+        r.done(tts, false);
+        assert!(r.fx.runs_started().is_empty());
+        assert_eq!(r.phase(), Phase::Idle);
+    }
+
+    #[test]
+    fn while_speaking_volume_words_act_without_a_click() {
+        for owns_music in [false, true] {
+            for c in [VoiceCommand::Louder, VoiceCommand::Quieter] {
+                let (mut r, _) = Rig::speaking(5, false);
+                r.clear();
+                assert_eq!(r.cmd(c, owns_music), CommandOutcome::Done);
+                assert_eq!(r.fx.calls, [Call::Music(action(c, false))]);
+                assert_eq!(r.phase(), Phase::Speaking);
+            }
+        }
+    }
+
+    #[test]
+    fn while_speaking_transport_words_need_own_music_and_leave_the_answer_playing() {
+        for c in [
+            VoiceCommand::Pause,
+            VoiceCommand::Resume,
+            VoiceCommand::Next,
+            VoiceCommand::Prev,
+        ] {
+            let (mut r, _) = Rig::speaking(5, false);
+            r.clear();
+            assert_eq!(r.cmd(c, false), CommandOutcome::NotForThisStation);
+            assert!(r.fx.calls.is_empty(), "{c:?}");
+            assert_eq!(r.cmd(c, true), CommandOutcome::Done);
+            assert_eq!(r.fx.calls, [Call::Music(action(c, false))], "{c:?}");
+            assert_eq!(r.phase(), Phase::Speaking);
+        }
+    }
+
+    #[test]
+    fn stop_cuts_an_announcement_and_leaves_the_music() {
+        let mut r = Rig::new(5);
+        let ann = r.announce(true);
+        r.clear();
+        assert_eq!(r.cmd(VoiceCommand::Stop, true), CommandOutcome::Done);
+        assert_eq!(r.fx.count(&Call::StopPlay(Channel::Announce)), 1);
+        assert!(!r.d.announcing);
+        assert_eq!(r.fx.shown_announcing(), Some(false));
+        assert_eq!(r.fx.duck(), Some(false));
+        assert!(r.fx.music().is_empty());
+        assert_eq!(r.fx.shows, [Ui::Idle]);
+        r.done(ann, false);
+        assert_eq!(r.fx.acks(), vec![false]);
+        assert!(r.fx.runs_started().is_empty());
+    }
+
+    #[test]
+    fn during_an_announcement_volume_words_do_not_click_and_transport_needs_own_music() {
+        let mut r = Rig::new(5);
+        r.announce(false);
+        r.clear();
+        assert_eq!(r.cmd(VoiceCommand::Louder, false), CommandOutcome::Done);
+        assert_eq!(
+            r.fx.calls,
+            [Call::Music(action(VoiceCommand::Louder, false))]
+        );
+        r.clear();
+        assert_eq!(
+            r.cmd(VoiceCommand::Next, false),
+            CommandOutcome::NotForThisStation
+        );
+        assert!(r.fx.calls.is_empty());
+        assert_eq!(r.cmd(VoiceCommand::Next, true), CommandOutcome::Done);
+        assert_eq!(r.fx.calls, [Call::Music(MusicAction::Next)]);
+        assert!(r.d.announcing);
+    }
+
+    #[test]
+    fn stop_ends_the_ring_and_leaves_the_music() {
+        let (mut r, _) = Rig::ringing();
+        r.clear();
+        assert_eq!(r.cmd(VoiceCommand::Stop, true), CommandOutcome::Done);
+        assert!(!r.d.timer_ringing);
+        assert_eq!(r.fx.count(&Call::StopPlay(Channel::Announce)), 1);
+        assert_eq!(r.fx.duck(), Some(false));
+        assert!(r.fx.music().is_empty());
+        assert_eq!(r.fx.shows, [Ui::Idle]);
+    }
+
+    #[test]
+    fn while_ringing_volume_words_do_not_click_and_transport_needs_own_music() {
+        let (mut r, _) = Rig::ringing();
+        r.clear();
+        assert_eq!(r.cmd(VoiceCommand::Quieter, false), CommandOutcome::Done);
+        assert_eq!(
+            r.fx.calls,
+            [Call::Music(action(VoiceCommand::Quieter, false))]
+        );
+        r.clear();
+        assert_eq!(
+            r.cmd(VoiceCommand::Pause, false),
+            CommandOutcome::NotForThisStation
+        );
+        assert!(r.fx.calls.is_empty());
+        assert!(r.d.timer_ringing);
+    }
+
+    #[test]
+    fn wake_word_and_stop_over_an_answer_cut_it_and_pause_the_music() {
+        let (mut r, _) = Rig::speaking(5, false);
+        assert!(r.wake("Алиса"));
+        r.clear();
+        assert_eq!(r.cmd(VoiceCommand::Stop, true), CommandOutcome::AfterWake);
+        r.assert_ended();
+        assert_eq!(r.fx.music(), [MusicAction::Pause]);
+    }
+
+    #[test]
+    fn commands_are_ignored_with_the_mic_off() {
+        for c in WORDS {
+            let mut r = Rig::woken();
+            r.d.set_mic_enabled(false, &mut r.fx);
+            r.clear();
+            assert_eq!(r.cmd(c, true), CommandOutcome::MicOff);
+            assert!(r.fx.calls.is_empty(), "{c:?}");
+        }
+    }
+
+    #[test]
+    fn volume_click_needs_idle_or_processing_and_a_free_announce_channel() {
+        let mut r = Rig::loud();
+        assert!(r.d.volume_click_allowed());
+        r.run_started();
+        assert!(!r.d.volume_click_allowed(), "listening");
+        r.ev(Va::SttEnd, &[]);
+        assert!(r.d.volume_click_allowed(), "processing");
+        r.ev(Va::TtsEnd, &[]);
+        assert!(!r.d.volume_click_allowed(), "speaking");
+        r.button();
+        assert!(r.d.volume_click_allowed());
+        r.announce(false);
+        assert!(!r.d.volume_click_allowed(), "announcing");
+        r.button();
+        assert!(r.d.volume_click_allowed());
+        r.ha_timer(HaTimerEvent::Finished);
+        assert!(!r.d.volume_click_allowed(), "ringing");
+        r.button();
+        assert!(r.d.volume_click_allowed());
+        r.run_started();
+        r.button();
+        let earcon = r.fx.last_play();
+        assert!(!r.d.volume_click_allowed(), "closing earcon");
+        r.done(earcon, true);
+        assert!(r.d.volume_click_allowed());
+    }
+
+    #[test]
+    fn stt_stop_after_the_wake_word_ends_the_run_and_pauses_the_music() {
+        for processing in [false, true] {
+            let mut r = Rig::woken();
+            r.timer(Timer::CommandWindow);
+            if processing {
+                r.ev(Va::SttVadEnd, &[]);
+            }
+            r.clear();
+            r.stt("Алиса, стоп!");
+            r.assert_ended();
+            assert_eq!(r.fx.stops(), 1);
+            assert!(r.fx.plays().is_empty());
+            assert_eq!(r.fx.music(), [MusicAction::Pause]);
+            assert_eq!(r.fx.shows.last(), Some(&Ui::Idle));
+        }
+    }
+
+    #[test]
+    fn stt_stop_after_the_wake_word_stops_a_ring_instead_of_the_music() {
+        let mut r = Rig::woken();
+        r.ha_timer(HaTimerEvent::Finished);
+        r.clear();
+        r.stt("стоп");
+        r.assert_ended();
+        assert!(!r.d.timer_ringing);
+        assert_eq!(r.fx.stops(), 1);
+        assert!(r.fx.music().is_empty());
+        assert!(r.fx.plays().is_empty());
+    }
+
+    #[test]
+    fn stt_stop_leaves_the_music_once_the_dialog_stopped_a_ring() {
+        for by_wake in [true, false] {
+            let mut r = Rig::woken();
+            r.ha_timer(HaTimerEvent::Finished);
+            if by_wake {
+                assert!(!r.wake("Алиса"));
+            } else {
+                r.timer(Timer::CommandWindow);
+                assert_eq!(r.cmd(VoiceCommand::Stop, false), CommandOutcome::InDialog);
+            }
+            assert!(!r.d.timer_ringing);
+            assert_eq!(r.phase(), Phase::Listening);
+            r.clear();
+            r.stt("хватит");
+            r.assert_ended();
+            assert_eq!(r.fx.stops(), 1);
+            assert!(r.fx.music().is_empty(), "by_wake {by_wake}");
+        }
+    }
+
+    #[test]
+    fn stt_stop_in_a_dialog_without_the_wake_word_cancels_it() {
+        for ring in [false, true] {
+            let mut r = Rig::loud();
+            r.button();
+            r.ev(Va::RunStart, &[("url", URL)]);
+            if ring {
+                r.ha_timer(HaTimerEvent::Finished);
+            }
+            r.clear();
+            r.stt("стоп-стоп");
+            assert!(!r.d.timer_ringing);
+            assert_eq!(r.phase(), Phase::Idle);
+            assert_eq!(r.fx.stops(), 1);
+            assert_eq!(r.fx.plays(), vec![sound(CANCEL)], "ring {ring}");
+            assert!(r.fx.music().is_empty());
+            assert_eq!(r.fx.duck(), Some(true));
+        }
+
+        let mut r = Rig::woken();
+        r.timer(Timer::CommandWindow);
+        let tts = r.answer(true, true);
+        r.done(tts, true);
+        r.ev(Va::RunStart, &[("url", URL)]);
+        r.clear();
+        r.stt("стоп");
+        assert_eq!(r.phase(), Phase::Idle);
+        assert_eq!(r.fx.plays(), vec![sound(CANCEL)], "follow-up turn");
+        assert!(r.fx.music().is_empty());
+    }
+
+    #[test]
+    fn stt_text_beyond_stop_words_stays_a_request() {
+        for (ev, text) in [
+            (Va::SttEnd, "стоп музыку"),
+            (Va::SttEnd, "хватит ли времени"),
+            (Va::SttVadEnd, "стоп"),
+        ] {
+            let mut r = Rig::woken();
+            r.clear();
+            r.ev(ev, &[("text", text)]);
+            assert_eq!(r.phase(), Phase::Processing, "{text}");
+            assert_eq!(r.fx.stops(), 0);
+            assert!(r.fx.music().is_empty());
+        }
     }
 }

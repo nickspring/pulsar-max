@@ -1,5 +1,8 @@
 use log::{debug, info, warn};
 use max_core::audio::{apply_gain, gain_from_db};
+use max_core::commands::{
+    MusicAction, MusicOp, MusicOwnership, MusicState, TransportCmd, command_of, music_ops,
+};
 use max_core::dialog::{Channel, Dialog, Effects, HaTimerEvent, PlayId, Sounds, Timer, Ui, Va};
 use max_core::input::{InputAction, Keypad, Press, knob_turn};
 use max_core::media::{self, MediaAction, MediaCmd, MediaRequest, Shown, VolumeSync};
@@ -13,13 +16,13 @@ use pulsar_esphome::{
     VaEvent,
 };
 use pulsar_lan::mdns::MdnsHandle;
-use pulsar_sendspin::{SendspinEvent, SendspinHandle};
+use pulsar_sendspin::{SendspinEvent, SendspinHandle, Transport};
 
 use crate::capture::AudioChunk;
 use crate::input::InputEvent;
 use crate::player::PlayerHandle;
 use crate::ring::RingHandle;
-use crate::wake::{WakeEvent, WakeHandle};
+use crate::wake::WakeHandle;
 use crate::{ESPHOME_SERVICE, VERSION, WAKE_PHRASE};
 
 /// Provisional: at 1-2 m `vqe_0` speech sits near -62 dBFS (docs/max.md, "Звук").
@@ -57,6 +60,7 @@ pub struct Controller {
     preroll: Preroll,
     wake: Option<WakeHandle>,
     pairing_prompt: bool,
+    ownership: MusicOwnership,
 }
 
 pub struct Fx {
@@ -71,6 +75,7 @@ pub struct Fx {
     volume: VolumeSync,
     music: PlayState,
     sendspin: Option<SendspinHandle>,
+    volume_click: Option<String>,
 }
 
 impl Controller {
@@ -84,7 +89,7 @@ impl Controller {
         sendspin: Option<SendspinHandle>,
     ) -> Self {
         Self {
-            dialog: Dialog::new(DEFAULT_FOLLOWUP_S, sounds),
+            dialog: Dialog::new(DEFAULT_FOLLOWUP_S, sounds.clone()),
             fx: Fx {
                 api,
                 player,
@@ -97,6 +102,7 @@ impl Controller {
                 volume: VolumeSync::default(),
                 music: PlayState::Idle,
                 sendspin,
+                volume_click: sounds.volume,
             },
             mdns,
             mic_gain_db: DEFAULT_MIC_GAIN_DB,
@@ -108,6 +114,7 @@ impl Controller {
             preroll: Preroll::new(PREROLL_SAMPLES),
             wake,
             pairing_prompt: false,
+            ownership: MusicOwnership::default(),
         }
     }
 
@@ -229,15 +236,33 @@ impl Controller {
         }
     }
 
-    pub fn on_wake(&mut self, ev: WakeEvent) {
+    pub fn on_wake(&mut self, end: u64) {
         if !self.dialog.wake(WAKE_PHRASE, &mut self.fx) {
             return;
         }
-        let start = preroll::command_start(ev.end, self.command_offset_ms);
+        let start = preroll::command_start(end, self.command_offset_ms);
         let preroll = self.preroll.since(start);
         for chunk in preroll.chunks(PREROLL_CHUNK) {
             self.send_audio(chunk.to_vec());
         }
+    }
+
+    pub fn on_command(&mut self, phrase: &str) {
+        let Some(c) = command_of(phrase) else {
+            debug!("command '{phrase}': no action on this station");
+            return;
+        };
+        let owns = self.ownership.owns(
+            pulsar_core::now_ms(),
+            self.fx.music,
+            self.fx.sendspin_streaming(),
+            self.fx
+                .sendspin
+                .as_ref()
+                .is_some_and(SendspinHandle::connected),
+        );
+        let outcome = self.dialog.command(c, owns, &mut self.fx);
+        info!("command '{phrase}': {outcome:?}");
     }
 
     fn send_audio(&self, mut samples: Vec<i16>) {
@@ -250,6 +275,7 @@ impl Controller {
             PlayerEvent::Done { id, ok } => self.dialog.on_play_done(id, ok, &mut self.fx),
             PlayerEvent::State(Channel::Music, st) => {
                 self.fx.music = st;
+                self.ownership.on_music_state(st, pulsar_core::now_ms());
                 self.fx.publish_media();
             }
             PlayerEvent::State(Channel::Announce, _) | PlayerEvent::Ready => {}
@@ -352,6 +378,8 @@ impl Controller {
     pub fn on_sendspin(&mut self, ev: SendspinEvent) {
         match ev {
             SendspinEvent::Stream(active) => {
+                self.ownership
+                    .on_sendspin_stream(active, self.fx.music, pulsar_core::now_ms());
                 if media::sendspin_stops_music(active, self.fx.music) {
                     self.fx.player.stop(Channel::Music);
                 }
@@ -448,6 +476,18 @@ impl Fx {
         }
     }
 
+    fn transport(&self, t: TransportCmd) {
+        let t = match t {
+            TransportCmd::Play => Transport::Play,
+            TransportCmd::Pause => Transport::Pause,
+            TransportCmd::Next => Transport::Next,
+            TransportCmd::Previous => Transport::Previous,
+        };
+        if !self.sendspin.as_ref().is_some_and(|ss| ss.transport(t)) {
+            info!("{t:?}: no Sendspin queue to act on");
+        }
+    }
+
     /// Shown once the helper reports STREAM_MUSIC back.
     fn set_volume(&mut self, v: f32) {
         self.player.set_volume(v);
@@ -457,6 +497,33 @@ impl Fx {
 }
 
 impl Effects for Fx {
+    fn music(&mut self, action: MusicAction) {
+        let state = MusicState {
+            music: self.music,
+            sendspin_streaming: self.sendspin_streaming(),
+            volume: self.volume.shown(),
+            muted: self.muted,
+        };
+        if state.volume.is_none() && matches!(action, MusicAction::Volume { .. }) {
+            warn!("volume step: STREAM_MUSIC volume unknown");
+        }
+        for op in music_ops(action, &state) {
+            match op {
+                MusicOp::PausePlayer => self.player.pause(Channel::Music),
+                MusicOp::ResumePlayer => self.player.resume(Channel::Music),
+                MusicOp::Transport(t) => self.transport(t),
+                MusicOp::Unmute => self.set_muted(false),
+                MusicOp::SetVolume { volume, click } => {
+                    self.set_volume(volume);
+                    if click && let Some(sound) = &self.volume_click {
+                        self.player.play(Channel::Announce, vec![sound.clone()]);
+                    }
+                }
+            }
+        }
+        self.publish_media();
+    }
+
     fn voice_subscribed(&self) -> bool {
         self.api.voice_subscribed()
     }

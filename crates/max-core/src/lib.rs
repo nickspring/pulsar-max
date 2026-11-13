@@ -4,6 +4,7 @@
 
 pub mod audio;
 pub mod backoff;
+pub mod commands;
 pub mod dialog;
 pub mod identity;
 pub mod inflight;

@@ -1,7 +1,8 @@
+use crate::commands::grid_step;
 use crate::player_proto::PlayState;
 
 pub const DUCK_GAIN: f32 = 0.15;
-const VOLUME_STEP: f32 = 0.05;
+const VOLUME_STEPS: i32 = 20;
 /// The player helper polls STREAM_MUSIC every 500 ms.
 const VOLUME_CONFIRM_MS: i64 = 2_000;
 
@@ -112,16 +113,9 @@ pub fn volume_from_index(index: u32, max: u32) -> f32 {
     (index.min(max) as f32 / max as f32).clamp(0.0, 1.0)
 }
 
-/// Lands on the 5 % grid, so repeated steps from an odd volume do not drift.
+/// pulsar's `step_level` on the 5 % grid.
 pub fn step_volume(volume: f32, up: bool) -> f32 {
-    let volume = if volume.is_nan() {
-        0.0
-    } else {
-        volume.clamp(0.0, 1.0)
-    };
-    let level = (volume / VOLUME_STEP).round();
-    let next = if up { level + 1.0 } else { level - 1.0 };
-    (next * VOLUME_STEP).clamp(0.0, 1.0)
+    grid_step(volume, VOLUME_STEPS, up)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -367,6 +361,13 @@ mod tests {
             false,
         );
         assert!(close(volumes(&down), &[0.45]), "{down:?}");
+        let between = media_actions(
+            req(Some(MediaCmd::VolumeDown)),
+            PlayState::Idle,
+            Some(0.07),
+            false,
+        );
+        assert!(close(volumes(&between), &[0.05]), "{between:?}");
         let r = MediaRequest {
             command: Some(MediaCmd::VolumeUp),
             volume: Some(f32::NAN),
@@ -546,10 +547,11 @@ mod tests {
     }
 
     #[test]
-    fn steps_snap_to_the_grid_and_stop_at_the_ends() {
-        assert!((step_volume(0.2, true) - 0.25).abs() < 1e-6);
-        assert!((step_volume(0.23, true) - 0.3).abs() < 1e-6);
-        assert!((step_volume(0.23, false) - 0.2).abs() < 1e-6);
+    fn steps_go_to_the_next_grid_point_and_stop_at_the_ends() {
+        assert_eq!(step_volume(0.2, true), 0.25);
+        assert_eq!(step_volume(0.23, true), 0.25);
+        assert_eq!(step_volume(0.23, false), 0.2);
+        assert_eq!(step_volume(0.08, true), 0.1);
         assert_eq!(step_volume(1.0, true), 1.0);
         assert_eq!(step_volume(0.0, false), 0.0);
         assert_eq!(step_volume(f32::NAN, true), 0.05);

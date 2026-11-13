@@ -137,19 +137,19 @@ fn freq_filter(flags: &Flags) -> Result<FreqFilterConfig, String> {
     })
 }
 
-fn number(v: &str) -> Option<f32> {
+pub(crate) fn number(v: &str) -> Option<f32> {
     v.parse().ok().filter(|x: &f32| x.is_finite())
 }
 
-fn positive(v: &str) -> Option<f32> {
+pub(crate) fn positive(v: &str) -> Option<f32> {
     number(v).filter(|&x| x > 0.0)
 }
 
-fn window(v: &str) -> Option<usize> {
+pub(crate) fn window(v: &str) -> Option<usize> {
     v.parse().ok().filter(|&frames| frames > 0)
 }
 
-fn flag(v: &str) -> Option<bool> {
+pub(crate) fn flag(v: &str) -> Option<bool> {
     match v {
         "true" | "1" => Some(true),
         "false" | "0" => Some(false),
@@ -157,12 +157,12 @@ fn flag(v: &str) -> Option<bool> {
     }
 }
 
-struct Flags<'a> {
-    values: HashMap<&'a str, &'a str>,
+pub(crate) struct Flags<'a> {
+    pub(crate) values: HashMap<&'a str, &'a str>,
 }
 
 impl<'a> Flags<'a> {
-    fn parse(text: &'a str) -> Self {
+    pub(crate) fn parse(text: &'a str) -> Self {
         let values = text
             .split(['\n', '\r'])
             .map(str::trim)
@@ -175,7 +175,7 @@ impl<'a> Flags<'a> {
         Self { values }
     }
 
-    fn get<T>(
+    pub(crate) fn get<T>(
         &self,
         key: &str,
         default: Option<T>,
@@ -187,7 +187,7 @@ impl<'a> Flags<'a> {
         }
     }
 
-    fn expect<T: PartialEq + Display>(
+    pub(crate) fn expect<T: PartialEq + Display>(
         &self,
         key: &str,
         default: Option<T>,

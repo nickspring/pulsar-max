@@ -35,7 +35,11 @@ Spotter references (`probes/spotter/`) need a venv with `numpy` and `ai-edge-lit
 `python3 -m venv /tmp/litert-venv && /tmp/litert-venv/bin/pip install numpy ai-edge-litert`.
 `golden_signal.py` regenerates `crates/max-wake/tests/fixtures/`, `chen14_ref.py` prints the
 golden chen14 cases; `proto.py <capture.raw> <model.tflite>` runs the whole spotter on a recording
-with a local copy of the station's model (kept in `dump/`, never in the repo).
+with a local copy of the station's model (kept in `dump/`, never in the repo). For the command
+spotter, `golden_command.py` regenerates its synthetic fixtures (a tiny random nnet3 in the stock
+format) and `cmd_ref.py <model_dir> <vqe16k.raw>` (or `--capture <48k 16ch.raw>`) is the reference;
+`MAX_CMD_MODEL=<dir> MAX_CMD_RAW=<16k.raw> cargo --locked test --release -p max-wake --test
+command_model -- --ignored --nocapture` runs the Rust one on a recording.
 `probes/ledpattern/golden_led.py` regenerates `crates/max-core/tests/fixtures/ledpattern.txt` from
 `ledref.py` (synthetic patterns only; stock `.led` files stay out of the repo).
 
@@ -108,6 +112,12 @@ and restore it as above.
   from its APK (`crates/pulsar-max/src/tflite.rs`). The capture thread tees positioned 16 kHz
   `vqe_0`/`vqe_bnr`/raw-mic chunks to the wake thread (`wake.rs`, bounded `try_send`); a hit
   carries the stream position, and the controller sends the `Preroll` after it, then live audio.
+- **Voice commands.** The same thread runs io.sdk's command spotter (`max-wake` `nnet.rs`,
+  `chen14_multi.rs`, `command.rs`: a Kaldi nnet3 Q16 model run in f32, multi-word chen14;
+  docs/max.md, "Команды стока") on `vqe_0`, model read in place (`command` in `spotter.json`).
+  pulsar's command rules are `max-core/src/commands.rs` and `Dialog::command`; `music_ops` turns
+  a `MusicAction` (`Effects::music`) into player, Sendspin and volume operations that the controller
+  only executes.
 - **Ring.** `max-core/src/ledpattern.rs` plays io.sdk's own `.led` patterns (format and player
   reverse-engineered, references in `probes/ledpattern/`), read in place from io.sdk's
   `ledpatterns/` dir; `max-core/src/ring.rs` maps the dialog's `Ui` states to them as stock does and

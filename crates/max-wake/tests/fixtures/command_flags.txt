@@ -1,0 +1,25 @@
+am-batch-size 4
+am-type nnet
+commands 1:2:3,4:6,4:7:1,2,7
+dither 0.1
+dynamically-quantized-matmul true
+feat-frontend log-mel-fbank
+feat-pipeline
+frame-shift 10
+frame-size 25
+hit-at-peak subhit
+interval-after-last-activation 12
+mel-num-bins 40
+metric geometric
+need-priors false
+nnet-representation float
+sample-rate 16000
+skip-rate 1
+spotter-type chen14
+subthresholds 0.714:0.091:0.306:0.522:0.285:0.207
+thresholds 0.714:0.091:0.306:0.522:0.285:0.207
+use-vad false
+version synthetic-commands
+w-max 30
+w-smooth 6
+zeroing-confidence-buffer-after-hit true

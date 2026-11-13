@@ -16,11 +16,40 @@ struct MelBank {
     weights: Box<[f32]>,
 }
 
-pub struct Fbank {
-    // One spectrum for both channels: the device's dither index runs omni frame, then bnr frame.
+struct LogMel {
     spectrum: Spectrum,
     banks: Box<[MelBank]>,
     power: Box<[f32]>,
+}
+
+impl LogMel {
+    fn new() -> Self {
+        let spectrum = Spectrum::new(FRAME_LEN, PREEMPH, DITHER, true);
+        let bins = spectrum.bins();
+        Self {
+            banks: mel_banks(bins),
+            power: vec![0.0; bins].into_boxed_slice(),
+            spectrum,
+        }
+    }
+
+    fn frame(&mut self, samples: &[i16], out: &mut Vec<f32>) {
+        self.spectrum.power(samples, &mut self.power);
+        out.extend(self.banks.iter().map(|bank| {
+            let power = &self.power[bank.first_bin..bank.first_bin + bank.weights.len()];
+            let energy = bank
+                .weights
+                .iter()
+                .zip(power)
+                .fold(0.0f32, |acc, (&w, &p)| acc + w * p);
+            energy.ln()
+        }));
+    }
+}
+
+pub struct Fbank {
+    // One spectrum for both channels: the device's dither index runs omni frame, then bnr frame.
+    mel: LogMel,
     omni: Vec<i16>,
     bnr: Vec<i16>,
 }
@@ -28,12 +57,8 @@ pub struct Fbank {
 impl Fbank {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
-        let spectrum = Spectrum::new(FRAME_LEN, PREEMPH, DITHER, true);
-        let bins = spectrum.bins();
         Self {
-            banks: mel_banks(bins),
-            power: vec![0.0; bins].into_boxed_slice(),
-            spectrum,
+            mel: LogMel::new(),
             omni: Vec::new(),
             bnr: Vec::new(),
         }
@@ -47,17 +72,7 @@ impl Fbank {
         let mut start = 0;
         while start + FRAME_LEN <= ready {
             for channel in [&self.omni, &self.bnr] {
-                self.spectrum
-                    .power(&channel[start..start + FRAME_LEN], &mut self.power);
-                out.extend(self.banks.iter().map(|bank| {
-                    let power = &self.power[bank.first_bin..bank.first_bin + bank.weights.len()];
-                    let energy = bank
-                        .weights
-                        .iter()
-                        .zip(power)
-                        .fold(0.0f32, |acc, (&w, &p)| acc + w * p);
-                    energy.ln()
-                }));
+                self.mel.frame(&channel[start..start + FRAME_LEN], out);
             }
             start += FRAME_SHIFT;
         }
@@ -68,7 +83,39 @@ impl Fbank {
     pub fn reset(&mut self) {
         self.omni.clear();
         self.bnr.clear();
-        self.spectrum.rewind_dither();
+        self.mel.spectrum.rewind_dither();
+    }
+}
+
+/// `Fbank` of one channel: the command spotter's input is `vqe` alone.
+pub struct MonoFbank {
+    mel: LogMel,
+    pending: Vec<i16>,
+}
+
+impl MonoFbank {
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
+        Self {
+            mel: LogMel::new(),
+            pending: Vec::new(),
+        }
+    }
+
+    /// Appends MEL_BINS values per completed frame.
+    pub fn push(&mut self, samples: &[i16], out: &mut Vec<f32>) {
+        self.pending.extend_from_slice(samples);
+        let mut start = 0;
+        while start + FRAME_LEN <= self.pending.len() {
+            self.mel.frame(&self.pending[start..start + FRAME_LEN], out);
+            start += FRAME_SHIFT;
+        }
+        self.pending.drain(..start);
+    }
+
+    pub fn reset(&mut self) {
+        self.pending.clear();
+        self.mel.spectrum.rewind_dither();
     }
 }
 
@@ -214,6 +261,76 @@ mod tests {
         fbank.push(&[0; 1], &[], &mut out);
         assert_eq!(out.len(), FEATURES);
         assert!(out.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn mono_matches_the_command_reference() {
+        let signal = crate::fixtures::command_signal();
+        let want = crate::fixtures::f32le(include_bytes!("../tests/fixtures/command_fbank.f32le"));
+        let mut out = Vec::new();
+        MonoFbank::new().push(&signal, &mut out);
+        assert_eq!(out.len(), want.len());
+        assert_eq!(
+            out.len(),
+            ((signal.len() - FRAME_LEN) / FRAME_SHIFT + 1) * MEL_BINS
+        );
+        let worst = out
+            .iter()
+            .zip(&want)
+            .map(|(g, w)| (g - w).abs())
+            .fold(0.0f32, f32::max);
+        // The reference runs numpy's f32 FFT, which is off in the weak low bins.
+        assert!(worst < 1e-4, "max abs difference {worst}");
+    }
+
+    #[test]
+    fn mono_dither_runs_one_frame_per_frame() {
+        let silence = [0i16; FRAME_LEN + FRAME_SHIFT];
+        let mut out = Vec::new();
+        MonoFbank::new().push(&silence, &mut out);
+        let mut spectrum = Spectrum::new(FRAME_LEN, PREEMPH, DITHER, true);
+        let mut power = vec![0.0; spectrum.bins()];
+        let banks = mel_banks(spectrum.bins());
+        for frame in out.as_chunks::<MEL_BINS>().0 {
+            spectrum.power(&[0; FRAME_LEN], &mut power);
+            let want: Vec<f32> = banks
+                .iter()
+                .map(|b| {
+                    let p = &power[b.first_bin..b.first_bin + b.weights.len()];
+                    b.weights
+                        .iter()
+                        .zip(p)
+                        .fold(0.0f32, |a, (&w, &p)| a + w * p)
+                        .ln()
+                })
+                .collect();
+            assert_eq!(frame[..], want[..]);
+        }
+    }
+
+    #[test]
+    fn mono_chunking_and_reset() {
+        let signal = crate::fixtures::command_signal();
+        let mut whole = Vec::new();
+        MonoFbank::new().push(&signal, &mut whole);
+
+        let mut fbank = MonoFbank::new();
+        let mut out = Vec::new();
+        fbank.push(&signal[..1000], &mut out);
+        fbank.reset();
+        out.clear();
+        let mut at = 0;
+        for size in [1usize, 159, 160, 399, 400, 401, 7, 3000].iter().cycle() {
+            let end = (at + size).min(signal.len());
+            let before = out.len();
+            fbank.push(&signal[at..end], &mut out);
+            assert_eq!((out.len() - before) % MEL_BINS, 0);
+            at = end;
+            if at == signal.len() {
+                break;
+            }
+        }
+        assert_eq!(out, whole);
     }
 
     #[test]

@@ -41,7 +41,9 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 use controller::{Controller, Flow, MUSIC_STYLES, Tick};
 use max_core::dialog::Sounds;
+use max_wake::command::CommandSpotter;
 use max_wake::spotter::Spotter;
+use wake::SpotEvent;
 
 pub(crate) const VERSION: &str = match option_env!("PULSAR_MAX_VERSION") {
     Some(v) => v,
@@ -61,6 +63,7 @@ const WAKE_WORD_ID: &str = "alisa";
 pub(crate) const WAKE_PHRASE: &str = "Алиса";
 const SPOTTER_CATALOG: &str = "/data/data/com.yandex.io.sdk/files/data/data/spotter.json";
 const SPOTTER_KIND: &str = "activation/alisa";
+const COMMAND_KIND: &str = "command";
 const STOCK_SOUNDS: &str = "/data/data/com.yandex.io.sdk/files/system/sounds/common";
 const TEARDOWN_SECS: u64 = 5;
 const FIRST_VOLUME_WAIT: Duration = Duration::from_secs(3);
@@ -77,7 +80,11 @@ fn main() -> ExitCode {
             error!("usage: pulsar-max --spot <capture.raw>");
             return ExitCode::from(2);
         };
-        let spotted = load_spotter().and_then(|s| replay::spot_file(Path::new(&file), s));
+        let spotter = load_spotter().map_err(|e| warn!("wake word off: {e}")).ok();
+        let commands = load_commands()
+            .map_err(|e| warn!("voice commands off: {e}"))
+            .ok();
+        let spotted = replay::spot_file(Path::new(&file), spotter, commands);
         return match spotted {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -158,6 +165,9 @@ async fn run(data_dir: &Path) -> u8 {
         format!("name={}", id.friendly_name),
     ];
     let spotter = load_spotter().map_err(|e| warn!("wake word off: {e}")).ok();
+    let commands = load_commands()
+        .map_err(|e| warn!("voice commands off: {e}"))
+        .ok();
     let wake_ids: Vec<String> = spotter.iter().map(|_| WAKE_WORD_ID.to_owned()).collect();
     let cfg = ApiConfig {
         port: API_PORT,
@@ -243,11 +253,8 @@ async fn run(data_dir: &Path) -> u8 {
         });
     }
     let mic_taken = yandex::take_mic();
-    let (wake, wake_audio, mut wake_events, _no_wake) = match spotter {
-        Some(s) => {
-            let (h, audio_tx, events) = wake::spawn(s);
-            (Some(h), Some(audio_tx), events, None)
-        }
+    let (wake, wake_audio, mut spot_events, _no_spotter) = match wake::spawn(spotter, commands) {
+        Some((h, audio_tx, events)) => (Some(h), Some(audio_tx), events, None),
         None => {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             (None, None, rx, Some(tx))
@@ -283,7 +290,10 @@ async fn run(data_dir: &Path) -> u8 {
             }
             Some(ev) = player_events.recv() => ctl.on_player(ev),
             Some(chunk) = audio.recv() => ctl.on_audio(chunk),
-            Some(ev) = wake_events.recv() => ctl.on_wake(ev),
+            Some(ev) = spot_events.recv() => match ev {
+                SpotEvent::Wake { end } => ctl.on_wake(end),
+                SpotEvent::Command { phrase } => ctl.on_command(&phrase),
+            },
             Some(ev) = ss_events.recv() => ctl.on_sendspin(ev),
             _ = term.recv() => break,
             _ = int.recv() => break,
@@ -349,6 +359,27 @@ fn load_spotter() -> Result<Spotter<tflite::Model>, String> {
     Ok(Spotter::new(&cfg, model))
 }
 
+fn load_commands() -> Result<CommandSpotter, String> {
+    let catalog =
+        std::fs::read_to_string(SPOTTER_CATALOG).map_err(|e| format!("{SPOTTER_CATALOG}: {e}"))?;
+    let dir = PathBuf::from(max_wake::catalog::model_dir(&catalog, COMMAND_KIND)?);
+    let read = |name: &str| {
+        let path = dir.join(name);
+        std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))
+    };
+    let text = |name: &str| String::from_utf8(read(name)?).map_err(|e| format!("{name}: {e}"));
+    let spotter = CommandSpotter::new(
+        &text("flags.txt")?,
+        &text("words.txt")?,
+        &read("acoustic_model.nnet")?,
+    )?;
+    info!(
+        "commands: model loaded, {} phrases",
+        spotter.phrases().len()
+    );
+    Ok(spotter)
+}
+
 /// io.sdk's own sound files, read in place (docs/max.md).
 fn sounds(data_dir: &Path) -> Sounds {
     let stock = |name: &str| {
@@ -370,6 +401,7 @@ fn sounds(data_dir: &Path) -> Sounds {
         cancel: stock("spotter_cancel.ogg"),
         error: stock("error.wav"),
         timer,
+        volume: stock("volume_change.wav"),
     }
 }
 
