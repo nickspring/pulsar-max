@@ -343,12 +343,12 @@ impl Controller {
             ApiEvent::VoiceEvent { event, data } => {
                 let ev = va(event);
                 if ev == Va::SttEnd {
-                    info!(
+                    debug!(
                         "voice: stt '{}'",
                         data.get("text").map_or("", String::as_str)
                     );
                 } else if ev == Va::Error {
-                    info!("voice: error {:?}", data.get("code"));
+                    debug!("voice: error {:?}", data.get("code"));
                 }
                 self.dialog.on_va(ev, &data, &mut self.fx);
             }

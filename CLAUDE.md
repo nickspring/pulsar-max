@@ -94,7 +94,7 @@ and restore it as above.
 - **Helpers.** The HAL is owned by `audioserver`; Yandex VQE runs there as a preprocessing
   effect for source `MIC`. `android/helper/MaxHelper.java` runs as root under `app_process` in two
   processes: `capture` (`AudioRecord` with `setChannelIndexMask(0xffff)`, needs a fake
-  `ActivityThread`/`opPackageName`; streams channels 1,2,3 = `vqe_0`, `vqe_bnr`, raw mic) and
+  `ActivityThread`/`opPackageName`; streams channels 1,2,3,13,14 = `vqe_0`, `vqe_bnr`, raw mic, speaker reference L/R) and
   `player` (`MediaPlayer` per channel, `STREAM_MUSIC` through reflected `IAudioService`). The line protocol is in
   docs/architecture.md, "Протокол помощников"; its Rust side is `max-core/src/player_proto.rs`.
   `crates/pulsar-max/src/{capture,player}.rs` spawn and restart them; `max-core` decimates

@@ -352,8 +352,7 @@ impl Screen<'_> {
         let end = monotonic_ns() + SETTLE_NS;
         while monotonic_ns() < end {
             if self.fb.differs(ours) {
-                let mut torn = [0; FRAME_BYTES];
-                self.fb.take_over(&mut torn, ours);
+                self.fb.store(ours);
             }
             std::hint::spin_loop();
         }

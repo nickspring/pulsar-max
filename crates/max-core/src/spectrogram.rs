@@ -2,9 +2,7 @@
 
 use std::f64::consts::PI;
 
-const WIDTH: usize = 25;
-const HEIGHT: usize = 16;
-const FRAME_BYTES: usize = WIDTH * HEIGHT * 3;
+use crate::screen::{FRAME_BYTES, Frame, HEIGHT, WIDTH};
 
 const NFFT: usize = 1024;
 const HALF: usize = NFFT / 2;
@@ -46,7 +44,8 @@ pub const STYLES: [Style; 6] = [
 ];
 
 impl Style {
-    pub fn name(self) -> &'static str {
+    #[cfg(test)]
+    fn name(self) -> &'static str {
         match self {
             Style::Flame => "flame",
             Style::WaveCenter => "waveCenter",
@@ -57,7 +56,8 @@ impl Style {
         }
     }
 
-    pub fn from_name(name: &str) -> Option<Style> {
+    #[cfg(test)]
+    fn from_name(name: &str) -> Option<Style> {
         STYLES.into_iter().find(|s| s.name() == name)
     }
 
@@ -126,8 +126,6 @@ struct Wave {
     bottom: bool,
 }
 
-pub type Frame = [u8; FRAME_BYTES];
-
 /// One message of gst's `spectrum` element: per-bin dB, averaged over the interval's FFTs.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Spectrum {
@@ -150,7 +148,8 @@ impl Spectrogram {
         }
     }
 
-    pub fn style(&self) -> Style {
+    #[cfg(test)]
+    fn style(&self) -> Style {
         self.style
     }
 

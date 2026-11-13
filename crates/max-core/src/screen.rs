@@ -140,7 +140,7 @@ const RETURN_HUNT_MS: i64 = 2_500;
 /// io.sdk silent, or rewriting the very bytes we show: a hunt has nothing to catch.
 const HUNT_EVERY_MS: i64 = 5_000;
 const GRID_STALE_MS: i64 = 5_000;
-pub const FOREIGN_DRAW_MS: i64 = 1_200;
+const FOREIGN_DRAW_MS: i64 = crate::ring::VOLUME_MS as i64;
 /// Without fresh frames (a capture stall) io.sdk's clock may come back instead of a frozen frame.
 const GUARD_FRESH_MS: i64 = 200;
 
