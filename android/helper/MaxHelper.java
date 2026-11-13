@@ -52,7 +52,7 @@ public final class MaxHelper {
     }
 
     private static int usage() {
-        System.err.println("usage: MaxHelper capture <hex channel index mask> <channel> | player");
+        System.err.println("usage: MaxHelper capture <hex channel index mask> <channel,...> | player");
         return 2;
     }
 
@@ -97,8 +97,8 @@ public final class MaxHelper {
         }
     }
 
-    private static int capture(String maskArg, String channelArg) {
-        Capture capture = Capture.parse(maskArg, channelArg);
+    private static int capture(String maskArg, String channelsArg) {
+        Capture capture = Capture.parse(maskArg, channelsArg);
         if (capture == null) {
             return usage();
         }
@@ -128,7 +128,8 @@ public final class MaxHelper {
             }
             return capture.pump(
                     frames -> rec.read(frames, 0, frames.length),
-                    new BufferedOutputStream(new FileOutputStream(FileDescriptor.out), Capture.CHUNK_FRAMES * 2),
+                    new BufferedOutputStream(new FileOutputStream(FileDescriptor.out),
+                            Capture.CHUNK_FRAMES * capture.selected.length * 2),
                     System.err::println);
         } finally {
             rec.release();

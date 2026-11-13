@@ -14,36 +14,47 @@ final class Capture {
 
     final int mask;
     final int channels;
-    final int channel;
+    final int[] selected;
 
-    private Capture(int mask, int channel) {
+    private Capture(int mask, int[] selected) {
         this.mask = mask;
         this.channels = Integer.bitCount(mask);
-        this.channel = channel;
+        this.selected = selected;
     }
 
-    /** Null when the arguments are malformed or the channel is outside the mask. */
-    static Capture parse(String maskArg, String channelArg) {
+    /** Null when the arguments are malformed or a channel is outside the mask. */
+    static Capture parse(String maskArg, String channelsArg) {
         int mask;
-        int channel;
+        String[] parts = channelsArg.split(",", -1);
+        int[] selected = new int[parts.length];
         try {
             mask = Integer.parseInt(maskArg, 16);
-            channel = Integer.parseInt(channelArg);
+            for (int i = 0; i < parts.length; i++) {
+                selected[i] = Integer.parseInt(parts[i]);
+            }
         } catch (NumberFormatException e) {
             return null;
         }
-        if (mask <= 0 || channel < 0 || channel >= Integer.bitCount(mask)) {
+        if (mask <= 0) {
             return null;
         }
-        return new Capture(mask, channel);
+        for (int c : selected) {
+            if (c < 0 || c >= Integer.bitCount(mask)) {
+                return null;
+            }
+        }
+        return new Capture(mask, selected);
     }
 
-    /** Writes the selected channel of {@code samples} interleaved samples as s16le; returns bytes. */
-    int extract(short[] frames, int samples, byte[] mono) {
+    /** Writes the selected channels of {@code samples} interleaved samples as s16le; returns bytes. */
+    int extract(short[] frames, int samples, byte[] out) {
         int len = 0;
-        for (int i = channel; i < samples; i += channels) {
-            mono[len++] = (byte) frames[i];
-            mono[len++] = (byte) (frames[i] >> 8);
+        for (int f = 0; f + channels <= samples; f += channels) {
+            for (int c : selected) {
+                short v = frames[f + c];
+                out[len++] = (byte) v;
+                out[len++] = (byte) (v >> 8);
+            }
         }
         return len;
     }
@@ -51,16 +62,16 @@ final class Capture {
     /** Streams until a read error (exit code 1) or a closed output (exit code 0). */
     int pump(Source source, OutputStream out, Consumer<String> log) {
         short[] frames = new short[CHUNK_FRAMES * channels];
-        byte[] mono = new byte[CHUNK_FRAMES * 2];
+        byte[] picked = new byte[CHUNK_FRAMES * selected.length * 2];
         while (true) {
             int n = source.read(frames);
             if (n < 0) {
                 log.accept("AudioRecord: read error " + n);
                 return 1;
             }
-            int len = extract(frames, n, mono);
+            int len = extract(frames, n, picked);
             try {
-                out.write(mono, 0, len);
+                out.write(picked, 0, len);
                 out.flush();
             } catch (IOException e) {
                 return 0;

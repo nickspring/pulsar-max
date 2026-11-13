@@ -186,6 +186,10 @@ name = "max-core"
 version = "0.1.0"
 
 [[package]]
+name = "max-wake"
+version = "0.1.0"
+
+[[package]]
 name = "mio"
 version = "1.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -269,6 +273,7 @@ dependencies = [
  "libc",
  "log",
  "max-core",
+ "max-wake",
  "pulsar-core",
  "pulsar-esphome",
  "pulsar-lan",

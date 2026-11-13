@@ -10,5 +10,7 @@ pub mod inflight;
 pub mod input;
 pub mod media;
 pub mod mic;
+pub mod package;
 pub mod pcm;
 pub mod player_proto;
+pub mod preroll;

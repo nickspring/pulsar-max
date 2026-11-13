@@ -11,6 +11,7 @@ final class CaptureTest {
         t.add("capture arguments", CaptureTest::parsesArguments);
         t.add("bad capture arguments", CaptureTest::rejectsBadArguments);
         t.add("extracts one channel as s16le", CaptureTest::extractsOneChannel);
+        t.add("extracts several channels interleaved", CaptureTest::extractsSeveralChannels);
         t.add("extract stops at the samples read", CaptureTest::extractStopsAtSamplesRead);
         t.add("pump streams until a read error", CaptureTest::pumpStreamsUntilReadError);
         t.add("pump writes short reads as they come", CaptureTest::pumpWritesShortReads);
@@ -19,16 +20,19 @@ final class CaptureTest {
 
     private static void parsesArguments() {
         Capture c = Capture.parse("ffff", "1");
-        Tests.eq(Arrays.asList(0xffff, 16, 1), Arrays.asList(c.mask, c.channels, c.channel));
+        Tests.eq(Arrays.asList(0xffff, 16, "[1]"), Arrays.asList(c.mask, c.channels, Arrays.toString(c.selected)));
         c = Capture.parse("0a", "1");
-        Tests.eq(Arrays.asList(0xa, 2, 1), Arrays.asList(c.mask, c.channels, c.channel));
+        Tests.eq(Arrays.asList(0xa, 2, "[1]"), Arrays.asList(c.mask, c.channels, Arrays.toString(c.selected)));
         c = Capture.parse("6000", "0");
-        Tests.eq(Arrays.asList(0x6000, 2, 0), Arrays.asList(c.mask, c.channels, c.channel));
+        Tests.eq(Arrays.asList(0x6000, 2, "[0]"), Arrays.asList(c.mask, c.channels, Arrays.toString(c.selected)));
+        c = Capture.parse("ffff", "1,2,3");
+        Tests.eq(Arrays.asList(0xffff, 16, "[1, 2, 3]"), Arrays.asList(c.mask, c.channels, Arrays.toString(c.selected)));
     }
 
     private static void rejectsBadArguments() {
         String[][] bad = {{"ffff", "16"}, {"0a", "2"}, {"zz", "1"}, {"0", "0"}, {"-1", "0"}, {"80000000", "0"},
-                {"ffff", "-1"}, {"ffff", "x"}, {"", "0"}, {"ffff", ""}};
+                {"ffff", "-1"}, {"ffff", "x"}, {"", "0"}, {"ffff", ""}, {"ffff", "1,16"}, {"ffff", "1,,2"},
+                {"ffff", "1,"}, {"ffff", ",1"}, {"3", "0,x"}};
         for (String[] args : bad) {
             Tests.check(Capture.parse(args[0], args[1]) == null, Arrays.toString(args));
         }
@@ -40,6 +44,14 @@ final class CaptureTest {
         byte[] mono = new byte[6];
         Tests.eq(6, c.extract(frames, frames.length, mono));
         Tests.eq(Arrays.toString(new byte[]{0x34, 0x12, (byte) 0xfe, (byte) 0xff, 0x00, (byte) 0x80}), Arrays.toString(mono));
+    }
+
+    private static void extractsSeveralChannels() {
+        Capture c = Capture.parse("f", "2,0");
+        short[] frames = {10, 11, 0x1234, 13, 20, 21, -2, 23, 99, 99};
+        byte[] out = new byte[8];
+        Tests.eq(8, c.extract(frames, 10, out));
+        Tests.eq(Arrays.toString(new byte[]{0x34, 0x12, 10, 0, (byte) 0xfe, (byte) 0xff, 20, 0}), Arrays.toString(out));
     }
 
     private static void extractStopsAtSamplesRead() {

@@ -5,20 +5,42 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
+use std::sync::mpsc::SyncSender;
+
 use log::{info, warn};
 use max_core::audio::Decimator;
-use max_core::pcm::S16Framer;
+use max_core::pcm::{Deinterleaver, S16Framer};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::helper::{self, Restarts};
 
 const CHANNEL_MASK: &str = "ffff";
-/// `vqe_0`, see docs/max.md, "Звук".
-const VQE_CHANNEL: &str = "1";
+/// `vqe_0`, `vqe_bnr` and the first raw mic (docs/max.md, "Звук"): the spotter's omni, bnr and
+/// frequency filter inputs; HA hears `vqe_0`.
+pub const CHANNELS: [usize; 3] = [1, 2, 3];
+const CHANNEL_COUNT: usize = CHANNELS.len();
 const INPUT_RATE: usize = 48_000;
 /// The HAL clicks up to 0 dBFS for about 0.5 s after every capture start.
-const SKIP_AFTER_START: usize = INPUT_RATE / 2;
-const READ_BYTES: usize = INPUT_RATE / 50 * 2;
+pub const SKIP_AFTER_START_FRAMES: usize = INPUT_RATE / 2;
+const SKIP_AFTER_START: usize = SKIP_AFTER_START_FRAMES * CHANNEL_COUNT;
+const READ_BYTES: usize = INPUT_RATE / 50 * 2 * CHANNEL_COUNT;
+/// A restart jumps the stream position by a second, so consumers see the lost audio as a gap.
+const RESTART_GAP: u64 = 16_000;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AudioChunk {
+    /// Position of the first sample in the 16 kHz stream.
+    pub pos: u64,
+    pub samples: Vec<i16>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpotterAudio {
+    pub pos: u64,
+    pub omni: Vec<i16>,
+    pub bnr: Vec<i16>,
+    pub raw: Vec<i16>,
+}
 
 pub struct CaptureHandle {
     shared: Arc<Shared>,
@@ -49,7 +71,10 @@ impl Shared {
     }
 }
 
-pub fn spawn(dex: PathBuf) -> (CaptureHandle, UnboundedReceiver<Vec<i16>>) {
+pub fn spawn(
+    dex: PathBuf,
+    wake: Option<SyncSender<SpotterAudio>>,
+) -> (CaptureHandle, UnboundedReceiver<AudioChunk>) {
     let (tx, rx) = unbounded_channel();
     let shared = Arc::new(Shared {
         stop: AtomicBool::new(false),
@@ -58,18 +83,24 @@ pub fn spawn(dex: PathBuf) -> (CaptureHandle, UnboundedReceiver<Vec<i16>>) {
     let s = shared.clone();
     let thread = std::thread::Builder::new()
         .name("capture".into())
-        .spawn(move || supervise(&s, &dex, &tx))
+        .spawn(move || supervise(&s, &dex, &tx, wake.as_ref()))
         .map_err(|e| warn!("capture: thread: {e}"))
         .ok();
     (CaptureHandle { shared, thread }, rx)
 }
 
-fn supervise(shared: &Shared, dex: &Path, tx: &UnboundedSender<Vec<i16>>) {
+fn supervise(
+    shared: &Shared,
+    dex: &Path,
+    tx: &UnboundedSender<AudioChunk>,
+    wake: Option<&SyncSender<SpotterAudio>>,
+) {
     let mut restarts = Restarts::new();
-    let mut decimator = Decimator::new();
+    let mut pos = 0u64;
     while !shared.stop.load(Ordering::Relaxed) {
         restarts.attempt();
-        let spawned = helper::command(dex, &["capture", CHANNEL_MASK, VQE_CHANNEL])
+        let channels = CHANNELS.map(|c| c.to_string()).join(",");
+        let spawned = helper::command(dex, &["capture", CHANNEL_MASK, &channels])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .spawn();
@@ -79,8 +110,8 @@ fn supervise(shared: &Shared, dex: &Path, tx: &UnboundedSender<Vec<i16>>) {
                     break;
                 };
                 info!("capture: helper started");
-                decimator.reset();
-                pump(out, &mut decimator, tx);
+                pump(out, &mut pos, tx, wake);
+                pos += RESTART_GAP;
                 let status = shared
                     .child
                     .lock()
@@ -99,10 +130,18 @@ fn supervise(shared: &Shared, dex: &Path, tx: &UnboundedSender<Vec<i16>>) {
     }
 }
 
-fn pump(mut out: impl Read, decimator: &mut Decimator, tx: &UnboundedSender<Vec<i16>>) {
+fn pump(
+    mut out: impl Read,
+    pos: &mut u64,
+    tx: &UnboundedSender<AudioChunk>,
+    wake: Option<&SyncSender<SpotterAudio>>,
+) {
     let mut buf = vec![0u8; READ_BYTES];
     let mut framer = S16Framer::new(SKIP_AFTER_START);
+    let mut split = Deinterleaver::new(CHANNEL_COUNT);
+    let mut decimators: [Decimator; CHANNEL_COUNT] = std::array::from_fn(|_| Decimator::new());
     let mut samples = Vec::with_capacity(READ_BYTES / 2 + 1);
+    let mut channels: [Vec<i16>; CHANNEL_COUNT] = Default::default();
     loop {
         let n = match out.read(&mut buf) {
             Ok(0) | Err(_) => return,
@@ -110,9 +149,34 @@ fn pump(mut out: impl Read, decimator: &mut Decimator, tx: &UnboundedSender<Vec<
         };
         samples.clear();
         framer.push(&buf[..n], &mut samples);
-        let mut out16 = Vec::with_capacity(samples.len() / 3 + 1);
-        decimator.process(&samples, &mut out16);
-        if !out16.is_empty() && tx.send(out16).is_err() {
+        channels.iter_mut().for_each(Vec::clear);
+        split.push(&samples, &mut channels);
+        let [omni, bnr, raw] = std::array::from_fn(|c| {
+            let mut out16 = Vec::with_capacity(channels[c].len() / 3 + 1);
+            decimators[c].process(&channels[c], &mut out16);
+            out16
+        });
+        if omni.is_empty() {
+            continue;
+        }
+        let at = *pos;
+        *pos += omni.len() as u64;
+        if let Some(w) = wake {
+            // Never block capture: a wake thread that falls behind loses frames, not the stream.
+            let _ = w.try_send(SpotterAudio {
+                pos: at,
+                omni: omni.clone(),
+                bnr,
+                raw,
+            });
+        }
+        if tx
+            .send(AudioChunk {
+                pos: at,
+                samples: omni,
+            })
+            .is_err()
+        {
             return;
         }
     }

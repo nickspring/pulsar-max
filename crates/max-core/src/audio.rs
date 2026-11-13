@@ -34,11 +34,6 @@ impl Decimator {
         );
         self.history.drain(..(out.len() - before) * FACTOR);
     }
-
-    pub fn reset(&mut self) {
-        self.history.clear();
-        self.history.resize(self.taps.len() - 1, 0);
-    }
 }
 
 fn filter(taps: &[f64], window: &[i16]) -> i16 {
@@ -250,18 +245,6 @@ mod tests {
         Decimator::new().process(&[1, 2, 3], &mut out);
         assert_eq!(out.len(), 2);
         assert_eq!(out[0], 42);
-    }
-
-    #[test]
-    fn reset_restores_fresh_state() {
-        let input = noise(3_001, 3);
-        let mut decimator = Decimator::new();
-        let mut scratch = Vec::new();
-        decimator.process(&noise(1_000, 4), &mut scratch);
-        decimator.reset();
-        let mut out = Vec::new();
-        decimator.process(&input, &mut out);
-        assert_eq!(out, decimate(&input));
     }
 
     #[test]

@@ -275,6 +275,16 @@ impl Dialog {
         self.begin_dialog(phrase, true, fx)
     }
 
+    /// pulsar's `on_wake`: a word heard while listening or processing is the same request, unless
+    /// the timer rings over it.
+    pub fn wake(&mut self, phrase: &str, fx: &mut impl Effects) -> bool {
+        let stops_ring = self.timer_ringing && self.mic_enabled;
+        if !stops_ring && matches!(self.phase, Phase::Listening | Phase::Processing) {
+            return false;
+        }
+        self.start(phrase, fx)
+    }
+
     pub fn on_va(&mut self, ev: Va, data: &HashMap<String, String>, fx: &mut impl Effects) {
         let get = |k: &str| data.get(k).map_or("", String::as_str);
         if !self.run.accept(ev) {
@@ -918,6 +928,10 @@ mod tests {
                 .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
                 .collect();
             self.d.on_va(ev, &data, &mut self.fx);
+        }
+
+        fn wake(&mut self, phrase: &str) -> bool {
+            self.d.wake(phrase, &mut self.fx)
         }
 
         fn start(&mut self, phrase: &str) -> bool {
@@ -2513,6 +2527,71 @@ mod tests {
         r.clear();
         assert!(!r.start("alice"));
         assert!(r.d.timer_ringing);
+        assert!(r.fx.calls.is_empty());
+    }
+
+    #[test]
+    fn wake_in_idle_starts_a_dialog_with_the_phrase() {
+        let mut r = Rig::new(5);
+        assert!(r.wake("Алиса"));
+        assert_eq!(r.phase(), Phase::Listening);
+        assert_eq!(r.fx.runs_started(), vec!["Алиса"]);
+    }
+
+    #[test]
+    fn wake_while_listening_or_processing_is_ignored() {
+        let mut r = Rig::new(5);
+        assert!(r.wake("Алиса"));
+        r.clear();
+        assert!(!r.wake("Алиса"));
+        assert!(r.fx.calls.is_empty());
+        r.ev(Va::RunStart, &[]);
+        r.ev(Va::SttVadEnd, &[]);
+        assert_eq!(r.phase(), Phase::Processing);
+        r.clear();
+        assert!(!r.wake("Алиса"));
+        assert!(r.fx.calls.is_empty());
+        assert_eq!(r.phase(), Phase::Processing);
+    }
+
+    #[test]
+    fn wake_while_speaking_cuts_the_answer() {
+        let (mut r, _) = Rig::speaking(5, true);
+        r.clear();
+        assert!(r.wake("Алиса"));
+        assert_eq!(r.phase(), Phase::Listening);
+        assert_eq!(r.fx.count(&Call::StopPlay(Channel::Announce)), 1);
+        assert_eq!(r.fx.runs_started(), vec!["Алиса"]);
+    }
+
+    #[test]
+    fn wake_while_ringing_only_stops_the_ring() {
+        let (mut r, _) = Rig::ringing();
+        r.clear();
+        assert!(!r.wake("Алиса"));
+        assert!(!r.d.timer_ringing);
+        assert!(r.fx.runs_started().is_empty());
+    }
+
+    #[test]
+    fn wake_stops_a_ring_that_started_during_the_dialog() {
+        let mut r = Rig::loud();
+        r.run_started();
+        r.ha_timer(HaTimerEvent::Finished);
+        assert!(r.d.timer_ringing);
+        r.clear();
+        assert!(!r.wake("Алиса"));
+        assert!(!r.d.timer_ringing);
+        assert_eq!(r.phase(), Phase::Listening);
+        assert!(r.fx.runs_started().is_empty());
+    }
+
+    #[test]
+    fn wake_with_the_mic_off_does_nothing() {
+        let mut r = Rig::new(5);
+        r.d.set_mic_enabled(false, &mut r.fx);
+        r.clear();
+        assert!(!r.wake("Алиса"));
         assert!(r.fx.calls.is_empty());
     }
 }

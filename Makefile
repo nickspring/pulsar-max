@@ -44,10 +44,10 @@ fmt:
 
 clippy: ndk
 	$(CARGO_ANDROID) clippy --target $(TARGET) --all-targets -- -D warnings
-	$(CARGO_ANDROID) clippy -p max-core --all-targets -- -D warnings
+	$(CARGO_ANDROID) clippy -p max-core -p max-wake --all-targets -- -D warnings
 
 test:
-	$(CARGO_ANDROID) test -p max-core
+	$(CARGO_ANDROID) test -p max-core -p max-wake
 
 # build.sh runs the helper's host tests before it builds the dex.
 test-helper:

@@ -15,7 +15,8 @@ pulsar поддерживает Buildroot-станции (Миди, Лайт 2, 
 объявления (`assist_satellite.announce`) и диалог, начатый из HA
 (`assist_satellite.start_conversation`): вопрос распознаётся, ответ звучит со станции. Кнопка
 Алисы начинает и отменяет диалог со звуками стока, кнопка микрофонов его запрещает, таймеры HA
-звонят и останавливаются кнопкой. Ключевого слова на станции и автозапуска пока нет. План —
+звонят и останавливаются кнопкой. Ключевое слово «Алиса» распознаётся на станции спотером стока:
+начинает диалог, перебивает ответ и останавливает звонок таймера. Автозапуска пока нет. План —
 [docs/architecture.md](docs/architecture.md#этапы).
 
 ## Требования
@@ -31,7 +32,7 @@ brew install --cask android-ndk       # или NDK=<путь> для make
 # помощники: JDK 17 и Android SDK (platforms/android-33, build-tools/36.0.0) в ANDROID_HOME
 # или ~/Library/Android/sdk
 make                                  # build/pulsar-max (aarch64-linux-android, API 28) и build/helper.dex
-make check                            # fmt, clippy -D warnings, тесты max-core на хосте
+make check                            # fmt, clippy -D warnings, тесты max-core и max-wake на хосте
 ```
 
 ## Структура
@@ -40,9 +41,10 @@ make check                            # fmt, clippy -D warnings, тесты max-
 |---|---|
 | `crates/pulsar-max` | демон: ESPHome API, mDNS, контроллер, процессы-помощники, отбор микрофона у `io.sdk` |
 | `crates/max-core` | логика без ввода-вывода: диалог, децимация 48 → 16 кГц, протокол помощников, медиа; тестируется на хосте |
+| `crates/max-wake` | спотер «Алиса» стока: признаки, решение `chen14`, частотный фильтр; модель — со станции; тестируется на хосте |
 | `android/helper` | помощники на Java (`app_process`): захват `AudioRecord` и плеер `MediaPlayer` |
 | `third_party/pulsar-lan` | `pulsar-lan` с исправлением сборки под Android ([README](third_party/README.md)) |
-| `probes/` | пробы железа: захват звука (Java через `app_process`), разбор записи, захват кнопок (`c/evgrab.c`, NDK) |
+| `probes/` | пробы железа: захват звука (Java через `app_process`), разбор записи, захват кнопок (`c/evgrab.c`), загрузка модели через `libtflite.so` (`c/tflite_check.c`); эталоны спотера на Python (`spotter/`) |
 | `docs/` | факты о станции и архитектура |
 
 ## Лицензия

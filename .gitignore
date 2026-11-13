@@ -12,6 +12,9 @@
 *.raw
 *.pcm
 *.wav
+*.tflite
+*.npy
+spotter.json
 
 .DS_Store
 .idea/

@@ -5,6 +5,7 @@ use max_core::input::{InputAction, Keypad, Press};
 use max_core::media::{self, MediaAction, MediaCmd, MediaRequest, Shown};
 use max_core::mic::Mics;
 use max_core::player_proto::{PlayState, PlayerEvent};
+use max_core::preroll::{self, Preroll};
 use pulsar_core::Timers;
 use pulsar_esphome::{
     AnnounceRequest, ApiEvent, ApiHandle, BinarySensorId, EventId, MediaCommand,
@@ -13,14 +14,20 @@ use pulsar_esphome::{
 };
 use pulsar_lan::mdns::MdnsHandle;
 
+use crate::capture::AudioChunk;
 use crate::input::InputEvent;
 use crate::player::PlayerHandle;
-use crate::{ESPHOME_SERVICE, VERSION};
+use crate::wake::{WakeEvent, WakeHandle};
+use crate::{ESPHOME_SERVICE, VERSION, WAKE_PHRASE};
 
 /// Provisional: at 1-2 m `vqe_0` speech sits near -62 dBFS (docs/max.md, "Звук").
 const DEFAULT_MIC_GAIN_DB: u32 = 24;
 const DEFAULT_FOLLOWUP_S: u32 = 10;
 const MUSIC_VIZ_OPTION: &str = "Off";
+/// Two seconds of 16 kHz audio: longer than the wake thread's queue, so the pre-roll is complete.
+const PREROLL_SAMPLES: usize = 32_000;
+/// pulsar's pre-roll chunking.
+const PREROLL_CHUNK: usize = 512;
 
 pub const MUSIC_STYLES: &[&str] = &[MUSIC_VIZ_OPTION];
 
@@ -40,9 +47,12 @@ pub struct Controller {
     fx: Fx,
     mdns: Option<MdnsHandle>,
     mic_gain_db: u32,
+    command_offset_ms: i32,
     followup_s: u32,
     mics: Mics,
     keypad: Keypad,
+    preroll: Preroll,
+    wake: Option<WakeHandle>,
 }
 
 pub struct Fx {
@@ -63,6 +73,7 @@ impl Controller {
         player: PlayerHandle,
         mdns: Option<MdnsHandle>,
         sounds: Sounds,
+        wake: Option<WakeHandle>,
     ) -> Self {
         Self {
             dialog: Dialog::new(DEFAULT_FOLLOWUP_S, sounds),
@@ -79,9 +90,12 @@ impl Controller {
             },
             mdns,
             mic_gain_db: DEFAULT_MIC_GAIN_DB,
+            command_offset_ms: 0,
             followup_s: DEFAULT_FOLLOWUP_S,
             mics: Mics::default(),
             keypad: Keypad::new(),
+            preroll: Preroll::new(PREROLL_SAMPLES),
+            wake,
         }
     }
 
@@ -140,6 +154,9 @@ impl Controller {
         let on = !self.mics.muted();
         self.fx.api.publish_switch(SwitchId::Microphones, on);
         self.dialog.set_mic_enabled(on, &mut self.fx);
+        if let Some(w) = &self.wake {
+            w.set_enabled(on);
+        }
     }
 
     pub fn publish_all(&self) {
@@ -152,7 +169,7 @@ impl Controller {
         api.publish_switch(SwitchId::VoiceIndication, true);
         api.publish_number(NumberId::MicGain, self.mic_gain_db as f32);
         api.publish_number(NumberId::FollowupDuration, self.followup_s as f32);
-        api.publish_number(NumberId::CommandOffset, 0.0);
+        api.publish_number(NumberId::CommandOffset, self.command_offset_ms as f32);
         api.publish_number(NumberId::LedSpeed, 1.0);
         api.publish_select(SelectId::MusicViz, MUSIC_VIZ_OPTION);
         api.publish_update(&UpdateState {
@@ -176,12 +193,27 @@ impl Controller {
         }
     }
 
-    pub fn on_audio(&mut self, mut chunk: Vec<i16>) {
-        if !self.fx.streaming {
+    pub fn on_audio(&mut self, chunk: AudioChunk) {
+        self.preroll.push(chunk.pos, &chunk.samples);
+        if self.fx.streaming {
+            self.send_audio(chunk.samples);
+        }
+    }
+
+    pub fn on_wake(&mut self, ev: WakeEvent) {
+        if !self.dialog.wake(WAKE_PHRASE, &mut self.fx) {
             return;
         }
-        apply_gain(&mut chunk, gain_from_db(self.mic_gain_db));
-        self.fx.api.voice_send_audio(chunk);
+        let start = preroll::command_start(ev.end, self.command_offset_ms);
+        let preroll = self.preroll.since(start);
+        for chunk in preroll.chunks(PREROLL_CHUNK) {
+            self.send_audio(chunk.to_vec());
+        }
+    }
+
+    fn send_audio(&self, mut samples: Vec<i16>) {
+        apply_gain(&mut samples, gain_from_db(self.mic_gain_db));
+        self.fx.api.voice_send_audio(samples);
     }
 
     pub fn on_player(&mut self, ev: PlayerEvent) {
@@ -287,6 +319,13 @@ impl Controller {
             NumberId::MicGain => {
                 self.mic_gain_db = v.round() as u32;
                 self.fx.api.publish_number(id, self.mic_gain_db as f32);
+            }
+            NumberId::CommandOffset => {
+                let Some(ms) = pulsar_esphome::command_offset_ms(v) else {
+                    return;
+                };
+                self.command_offset_ms = ms;
+                self.fx.api.publish_number(id, ms as f32);
             }
             NumberId::FollowupDuration => {
                 self.followup_s = v.round() as u32;

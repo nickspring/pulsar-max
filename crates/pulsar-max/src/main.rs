@@ -1,5 +1,5 @@
 //! pulsar-max: Home Assistant voice satellite for Yandex Station Max.
-//! usage: pulsar-max [--version | data_dir]
+//! usage: pulsar-max [--version | --spot <capture.raw> | data_dir]
 #![deny(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(clippy::undocumented_unsafe_blocks)]
@@ -9,8 +9,12 @@ mod controller;
 mod helper;
 mod input;
 mod player;
+mod replay;
 #[allow(unsafe_code)]
 mod sys;
+#[allow(unsafe_code)]
+mod tflite;
+mod wake;
 mod yandex;
 
 use std::ffi::OsStr;
@@ -24,12 +28,13 @@ use std::time::Duration;
 use log::{error, info, warn};
 use max_core::identity::{self, FRIENDLY_NAME, MANUFACTURER, MODEL_NAME, PLATFORM};
 use pulsar_core::actors;
-use pulsar_esphome::{ApiConfig, DeviceIdentity};
+use pulsar_esphome::{ApiConfig, DeviceIdentity, WakeWordInfo};
 use pulsar_lan::mdns::{self, MdnsService};
 use tokio::signal::unix::{Signal, SignalKind, signal};
 
 use controller::{Controller, Flow, MUSIC_STYLES, Tick};
 use max_core::dialog::Sounds;
+use max_wake::spotter::Spotter;
 
 pub(crate) const VERSION: &str = match option_env!("PULSAR_MAX_VERSION") {
     Some(v) => v,
@@ -43,6 +48,10 @@ const DEFAULT_DATA_DIR: &str = "/data/pulsar-max";
 const API_PORT: u16 = 6053;
 pub(crate) const ESPHOME_SERVICE: &str = "_esphomelib._tcp";
 const ALERT_FILE: &str = "timer_alert.wav";
+const WAKE_WORD_ID: &str = "alisa";
+pub(crate) const WAKE_PHRASE: &str = "Алиса";
+const SPOTTER_CATALOG: &str = "/data/data/com.yandex.io.sdk/files/data/data/spotter.json";
+const SPOTTER_KIND: &str = "activation/alisa";
 const STOCK_SOUNDS: &str = "/data/data/com.yandex.io.sdk/files/system/sounds/common";
 const TEARDOWN_SECS: u64 = 5;
 
@@ -51,6 +60,21 @@ fn main() -> ExitCode {
     if arg.as_deref() == Some(OsStr::new("--version")) {
         let _ = writeln!(std::io::stdout(), "pulsar-max {VERSION}");
         return ExitCode::SUCCESS;
+    }
+    if arg.as_deref() == Some(OsStr::new("--spot")) {
+        pulsar_core::init_logger();
+        let Some(file) = std::env::args_os().nth(2) else {
+            error!("usage: pulsar-max --spot <capture.raw>");
+            return ExitCode::from(2);
+        };
+        let spotted = load_spotter().and_then(|s| replay::spot_file(Path::new(&file), s));
+        return match spotted {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                error!("{e}");
+                ExitCode::from(1)
+            }
+        };
     }
     let data_dir = arg.map_or_else(|| PathBuf::from(DEFAULT_DATA_DIR), PathBuf::from);
 
@@ -108,8 +132,19 @@ fn device_identity() -> DeviceIdentity {
 async fn run(data_dir: &Path) -> u8 {
     let id = device_identity();
     let name = id.name.clone();
+    let spotter = load_spotter().map_err(|e| warn!("wake word off: {e}")).ok();
+    let wake_ids: Vec<String> = spotter.iter().map(|_| WAKE_WORD_ID.to_owned()).collect();
     let cfg = ApiConfig {
         port: API_PORT,
+        wake_words: wake_ids
+            .iter()
+            .map(|id| WakeWordInfo {
+                id: id.clone(),
+                phrase: WAKE_PHRASE.into(),
+                languages: vec!["ru".into()],
+            })
+            .collect(),
+        active_wake_words: wake_ids.clone(),
         music_styles: MUSIC_STYLES.iter().map(|s| (*s).to_owned()).collect(),
         has_clock: false,
         has_lux: false,
@@ -160,9 +195,19 @@ async fn run(data_dir: &Path) -> u8 {
     let sounds = sounds(data_dir);
     let (player, mut player_events) = player::spawn(dex.clone());
     let mic_taken = yandex::take_mic();
-    let (capture, mut audio) = capture::spawn(dex);
+    let (wake, wake_audio, mut wake_events, _no_wake) = match spotter {
+        Some(s) => {
+            let (h, audio_tx, events) = wake::spawn(s);
+            (Some(h), Some(audio_tx), events, None)
+        }
+        None => {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            (None, None, rx, Some(tx))
+        }
+    };
+    let (capture, mut audio) = capture::spawn(dex, wake_audio);
     let (_input, mut keys) = input::spawn();
-    let mut ctl = Controller::new(api, player, mdns, sounds);
+    let mut ctl = Controller::new(api, player, mdns, sounds, wake);
     ctl.publish_all();
     info!("pulsar-max {VERSION} running as {name}");
 
@@ -186,6 +231,7 @@ async fn run(data_dir: &Path) -> u8 {
             }
             Some(ev) = player_events.recv() => ctl.on_player(ev),
             Some(chunk) = audio.recv() => ctl.on_audio(chunk),
+            Some(ev) = wake_events.recv() => ctl.on_wake(ev),
             _ = term.recv() => break,
             _ = int.recv() => break,
             _ = hup.recv() => break,
@@ -200,6 +246,29 @@ async fn run(data_dir: &Path) -> u8 {
         restored.store(true, Ordering::Relaxed);
     }
     0
+}
+
+/// io.sdk's own model, read in place: its files may not leave the station (docs/max.md).
+fn load_spotter() -> Result<Spotter<tflite::Model>, String> {
+    let catalog =
+        std::fs::read_to_string(SPOTTER_CATALOG).map_err(|e| format!("{SPOTTER_CATALOG}: {e}"))?;
+    let dir = PathBuf::from(max_wake::catalog::model_dir(&catalog, SPOTTER_KIND)?);
+    let flags_path = dir.join("flags.txt");
+    let flags = std::fs::read_to_string(&flags_path)
+        .map_err(|e| format!("{}: {e}", flags_path.display()))?;
+    let cfg = max_wake::config::parse_flags(&flags)?;
+    let model = tflite::Model::load(&yandex::tflite_library(), &dir.join("model.tflite"))?;
+    info!(
+        "wake: '{}' model {} loaded, frequency filter {}",
+        cfg.phrase,
+        cfg.version,
+        if cfg.freq_filter.is_some() {
+            "on"
+        } else {
+            "off"
+        }
+    );
+    Ok(Spotter::new(&cfg, model))
 }
 
 /// io.sdk's own sound files, read in place (docs/max.md).

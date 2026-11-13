@@ -16,13 +16,20 @@ SDK); override with `make NDK=<path>`.
 ```sh
 make                      # build/pulsar-max (+ .debug, aarch64-linux-android API 28) and build/helper.dex
                           # (helpers need JDK 17 and the Android SDK: platforms/android-33, build-tools/36.0.0)
-make check                # cargo fmt --check, clippy -D warnings (Android target + max-core on host), tests
-make test                 # cargo test -p max-core (host)
+make check                # cargo fmt --check, clippy -D warnings (Android target + max-core, max-wake on host), tests
+make test                 # cargo test -p max-core -p max-wake (host)
 cargo --locked test -p max-core identity::tests::name_from_sysfs_line   # single test
 probes/java/build.sh      # Java probe -> probes/java/build/classes.dex (JDK 17, SDK android-33, d8)
-probes/c/build.sh         # C probes (NDK clang) -> probes/c/build/; evgrab <dev> <sec> tests EVIOCGRAB
+probes/c/build.sh         # C probes (NDK clang) -> probes/c/build/; evgrab <dev> <sec> tests EVIOCGRAB,
+                          # tflite_check <lib> <model> loads a model the way io.sdk does and times it
 python3 -I probes/analyze_capture.py <file.raw> 16 [rate] [tone_hz] ["a-b,c-d"]   # per-channel levels
 ```
+
+Spotter references (`probes/spotter/`) need a venv with `numpy` and `ai-edge-litert`:
+`python3 -m venv /tmp/litert-venv && /tmp/litert-venv/bin/pip install numpy ai-edge-litert`.
+`golden_signal.py` regenerates `crates/max-wake/tests/fixtures/`, `chen14_ref.py` prints the
+golden chen14 cases; `proto.py <capture.raw> <model.tflite>` runs the whole spotter on a recording
+with a local copy of the station's model (kept in `dump/`, never in the repo).
 
 `cargo --locked` is used everywhere: commit `Cargo.lock` changes deliberately.
 
@@ -38,6 +45,7 @@ st "mkdir -p $T"
 st "cat > $T/pulsar-max && chmod 755 $T/pulsar-max" < build/pulsar-max
 st "cat > $T/helper.dex" < build/helper.dex     # found next to the binary
 ssh -t -p 2222 root@<station> "$T/pulsar-max $T/data"   # Ctrl-C to stop
+st "cat > $T/rec.raw" < rec.raw; st "$T/pulsar-max --spot $T/rec.raw"   # wake word on a recording
 st "cat > $T/probe.dex" < probes/java/build/classes.dex
 st "CLASSPATH=$T/probe.dex app_process /system/bin MaxProbe record 8 $T/out.raw ffff 1 0.05"
 st "cat $T/out.raw" > out.raw                    # binary only on this stream
@@ -50,10 +58,11 @@ and restore it as above.
 
 ## Architecture
 
-- **Workspace split.** `crates/max-core` holds all logic without IO and without pulsar crates, so
-  it builds and is tested on the macOS host. `crates/pulsar-max` is the Android-only daemon (glue,
-  IO, `sys.rs` FFI); it depends on `pulsar-lan`, which uses netlink and does not build off Linux.
-  New logic goes into `max-core` with tests; the daemon stays thin.
+- **Workspace split.** `crates/max-core` (dialog, audio, helper protocol, media) and
+  `crates/max-wake` (spotter) hold all logic without IO and without pulsar crates, so they build
+  and are tested on the macOS host. `crates/pulsar-max` is the Android-only daemon (glue, IO,
+  `sys.rs`/`tflite.rs` FFI); it depends on `pulsar-lan`, which uses netlink and does not build off
+  Linux. New logic goes into the host crates with tests; the daemon stays thin.
 - **pulsar as a dependency.** `pulsar-core`, `pulsar-esphome`, `pulsar-lan` come from the pulsar
   git tag in `Cargo.toml` (`[workspace.dependencies]`). External deps are pinned exactly to the
   versions of `satellite/Cargo.toml` of that tag; when bumping the tag, re-sync the pins.
@@ -62,13 +71,13 @@ and restore it as above.
 - **Execution model** follows pulsar's `docs/architecture.md`, "Модель исполнения": one tokio
   `current_thread` runtime with a `LocalSet`, services are actors spawned through
   `pulsar_core::actors` returning non-blocking `Clone` handles plus event receivers; blocking or
-  realtime loops run on named `std::thread`s; `unsafe` and libc only in `sys.rs` with
+  realtime loops run on named `std::thread`s; `unsafe` and libc only in `sys.rs`/`tflite.rs` with
   `// SAFETY:` (enforced by `#![deny(clippy::undocumented_unsafe_blocks)]`).
 - **Helpers.** The HAL is owned by `audioserver`; Yandex VQE runs there as a preprocessing
   effect for source `MIC`. `android/helper/MaxHelper.java` runs as root under `app_process` in two
   processes: `capture` (`AudioRecord` with `setChannelIndexMask(0xffff)`, needs a fake
-  `ActivityThread`/`opPackageName`; streams channel 1 = `vqe_0`) and `player` (`MediaPlayer` per
-  channel, `STREAM_MUSIC` through reflected `IAudioService`). The line protocol is in
+  `ActivityThread`/`opPackageName`; streams channels 1,2,3 = `vqe_0`, `vqe_bnr`, raw mic) and
+  `player` (`MediaPlayer` per channel, `STREAM_MUSIC` through reflected `IAudioService`). The line protocol is in
   docs/architecture.md, "Протокол помощников"; its Rust side is `max-core/src/player_proto.rs`.
   `crates/pulsar-max/src/{capture,player}.rs` spawn and restart them; `max-core` decimates
   48 -> 16 kHz and keeps the exactly-one-`done`-per-play bookkeeping (`inflight.rs`).
@@ -78,6 +87,13 @@ and restore it as above.
   pulsar-esphome hardcodes flags=0, so HA-side wake word is not available. The action button
   starts runs too. Earcons and the HA timer ring play io.sdk's own sound files in place
   (`Sounds`, built in main.rs), the timer falling back to a generated `timer_alert.wav`.
+- **Wake word.** `crates/max-wake` is io.sdk's own "Алиса" spotter reimplemented (fbank,
+  chen14 decision, anti-ad frequency filter; docs/max.md, "Ключевое слово"), host-tested against
+  the Python references in `probes/spotter/`. On the station the model and `flags.txt` are read in
+  place from io.sdk's `spotter.json` catalog and run by io.sdk's `libtflite.so`, dlopened straight
+  from its APK (`crates/pulsar-max/src/tflite.rs`). The capture thread tees positioned 16 kHz
+  `vqe_0`/`vqe_bnr`/raw-mic chunks to the wake thread (`wake.rs`, bounded `try_send`); a hit
+  carries the stream position, and the controller sends the `Preroll` after it, then live audio.
 - **Buttons.** `crates/pulsar-max/src/input.rs` EVIOCGRABs `gpio_keypad` (io.sdk would answer the
   action button too); `max-core/src/input.rs` decodes events and classifies presses (pulsar-hw
   timing; presses are timed in the reader thread). The knob stays with io.sdk, which drives
