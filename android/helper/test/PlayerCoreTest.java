@@ -32,7 +32,7 @@ final class PlayerCoreTest {
         t.add("pause, resume, stop without a play are ignored", PlayerCoreTest::idleCommandsAreIgnored);
         t.add("gain persists per channel", PlayerCoreTest::gainPersistsPerChannel);
         t.add("malformed commands are logged and ignored", PlayerCoreTest::malformedCommands);
-        t.add("volume command sets and reports changes", PlayerCoreTest::volumeCommandSetsAndReports);
+        t.add("volume command sets and always answers", PlayerCoreTest::volumeCommandSetsAndReports);
         t.add("volume poll reports knob changes", PlayerCoreTest::volumePollReportsKnob);
         t.add("volume open failure leaves playback working", PlayerCoreTest::volumeOpenFailure);
         t.add("volume with no max is disabled", PlayerCoreTest::volumeWithoutMax);
@@ -311,6 +311,8 @@ final class PlayerCoreTest {
         f.send("volume\t0.500");
         Tests.eq(Tests.lines("volume\t50\t100"), f.take());
         f.send("volume\t0.5");
+        Tests.eq(Tests.lines("volume\t50\t100"), f.take());
+        Tests.check(f.core.pollVolume(), "poll keeps going");
         Tests.eq(NONE, f.take());
         f.send("volume\t0.333");
         f.send("volume\t0.336");

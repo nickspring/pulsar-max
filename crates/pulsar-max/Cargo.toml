@@ -11,6 +11,7 @@ max-wake = { path = "../max-wake" }
 pulsar-core = { workspace = true }
 pulsar-esphome = { workspace = true }
 pulsar-lan = { workspace = true }
+pulsar-sendspin = { workspace = true }
 tokio = { workspace = true }
 log = { workspace = true }
 libc = { workspace = true }

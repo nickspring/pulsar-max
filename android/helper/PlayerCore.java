@@ -72,12 +72,12 @@ final class PlayerCore {
             disableVolume(e);
         }
         emit("ready");
-        reportVolume();
+        reportVolume(false);
     }
 
     /** False once volume is unavailable, so the caller can stop polling. */
     boolean pollVolume() {
-        reportVolume();
+        reportVolume(false);
         return volume != null;
     }
 
@@ -132,10 +132,11 @@ final class PlayerCore {
             disableVolume(e);
             return;
         }
-        reportVolume();
+        // The daemon waits for this answer to tell its own request from a knob turn.
+        reportVolume(true);
     }
 
-    private void reportVolume() {
+    private void reportVolume(boolean always) {
         if (volume == null) {
             return;
         }
@@ -146,7 +147,7 @@ final class PlayerCore {
             disableVolume(e);
             return;
         }
-        if (index != reportedVolume) {
+        if (always || index != reportedVolume) {
             reportedVolume = index;
             emit("volume\t" + index + "\t" + volumeMax);
         }

@@ -2,6 +2,8 @@ use crate::player_proto::PlayState;
 
 pub const DUCK_GAIN: f32 = 0.15;
 const VOLUME_STEP: f32 = 0.05;
+/// The player helper polls STREAM_MUSIC every 500 ms.
+const VOLUME_CONFIRM_MS: i64 = 2_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Shown {
@@ -11,12 +13,19 @@ pub enum Shown {
     Announcing,
 }
 
-pub fn shown_state(announcing: bool, music: PlayState) -> Shown {
+/// pulsar's rule: a Sendspin stream shows as playing over a paused or idle HA channel.
+/// pulsar: Music Assistant taking the speaker stops HA's own music.
+pub fn sendspin_stops_music(stream_started: bool, music: PlayState) -> bool {
+    stream_started && music != PlayState::Idle
+}
+
+pub fn shown_state(announcing: bool, music: PlayState, sendspin: bool) -> Shown {
     if announcing {
         return Shown::Announcing;
     }
     match music {
         PlayState::Playing | PlayState::Loading => Shown::Playing,
+        _ if sendspin => Shown::Playing,
         PlayState::Paused => Shown::Paused,
         PlayState::Idle | PlayState::Error => Shown::Idle,
     }
@@ -39,6 +48,61 @@ pub fn channel_gains(muted: bool, ducked: bool) -> Gains {
         music: if ducked { DUCK_GAIN } else { 1.0 },
         announce: 1.0,
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VolumeChange {
+    pub volume: f32,
+    pub settled: bool,
+    /// pulsar: a local change (here the knob, through io.sdk) unmutes.
+    pub unmute: bool,
+}
+
+/// STREAM_MUSIC as the player helper reports it, told apart from the daemon's own requests.
+#[derive(Clone, Debug, Default)]
+pub struct VolumeSync {
+    shown: Option<f32>,
+    requested: Option<(f32, i64)>,
+}
+
+impl VolumeSync {
+    pub fn shown(&self) -> Option<f32> {
+        self.shown
+    }
+
+    pub fn request(&mut self, volume: f32, now_ms: i64) {
+        self.requested = Some((volume, now_ms + VOLUME_CONFIRM_MS));
+    }
+
+    /// The helper answers every request, so a report that matches none is a local change.
+    pub fn on_report(&mut self, volume: f32, now_ms: i64) -> VolumeChange {
+        let changed = self.shown.is_some_and(|s| percent(s) != percent(volume));
+        self.shown = Some(volume);
+        let own = |settled| VolumeChange {
+            volume,
+            settled,
+            unmute: false,
+        };
+        if let Some((want, until)) = self.requested {
+            if percent(want) == percent(volume) {
+                self.requested = None;
+                return own(true);
+            }
+            if now_ms < until {
+                return own(false);
+            }
+            self.requested = None;
+        }
+        VolumeChange {
+            volume,
+            settled: true,
+            unmute: changed,
+        }
+    }
+}
+
+fn percent(v: f32) -> i32 {
+    (v * 100.0).round() as i32
 }
 
 pub fn volume_from_index(index: u32, max: u32) -> f32 {
@@ -90,17 +154,31 @@ pub enum MediaAction {
     Pause,
     Stop,
     SetMuted(bool),
+    /// Leave the Sendspin group: Music Assistant stops this speaker, the rest of the group plays on.
+    LeaveSendspin,
 }
 
-/// pulsar's order: url, then volume, then the command. Volume steps need a known volume.
-pub fn media_actions(req: MediaRequest, music: PlayState, volume: Option<f32>) -> Vec<MediaAction> {
+/// pulsar's order: url, then volume, then the command. Volume steps need a known volume. While
+/// Sendspin streams (`sendspin`), HA's own playback and its pause / stop take the speaker from it.
+pub fn media_actions(
+    req: MediaRequest,
+    music: PlayState,
+    volume: Option<f32>,
+    sendspin: bool,
+) -> Vec<MediaAction> {
     let mut out = Vec::new();
+    let leave = |out: &mut Vec<MediaAction>| {
+        if sendspin {
+            out.push(MediaAction::LeaveSendspin);
+        }
+    };
     if let Some(url) = req.url {
-        out.push(if req.announcement {
-            MediaAction::Announce(url)
+        if req.announcement {
+            out.push(MediaAction::Announce(url));
         } else {
-            MediaAction::PlayMusic(url)
-        });
+            leave(&mut out);
+            out.push(MediaAction::PlayMusic(url));
+        }
     }
     let mut volume = volume;
     if let Some(v) = req.volume {
@@ -109,11 +187,25 @@ pub fn media_actions(req: MediaRequest, music: PlayState, volume: Option<f32>) -
         out.push(MediaAction::SetVolume(v));
     }
     match req.command {
-        Some(MediaCmd::Play) => out.push(MediaAction::Resume),
-        Some(MediaCmd::Pause) => out.push(MediaAction::Pause),
+        Some(MediaCmd::Play) => {
+            if music == PlayState::Paused {
+                leave(&mut out);
+            }
+            out.push(MediaAction::Resume);
+        }
+        Some(MediaCmd::Pause) => {
+            if music != PlayState::Playing {
+                leave(&mut out);
+            }
+            out.push(MediaAction::Pause);
+        }
         Some(MediaCmd::Toggle) if music == PlayState::Playing => out.push(MediaAction::Pause),
+        Some(MediaCmd::Toggle) if sendspin => leave(&mut out),
         Some(MediaCmd::Toggle) => out.push(MediaAction::Resume),
-        Some(MediaCmd::Stop) => out.push(MediaAction::Stop),
+        Some(MediaCmd::Stop) => {
+            out.push(MediaAction::Stop);
+            leave(&mut out);
+        }
         Some(MediaCmd::Mute) => out.push(MediaAction::SetMuted(true)),
         Some(MediaCmd::Unmute) => out.push(MediaAction::SetMuted(false)),
         Some(cmd @ (MediaCmd::VolumeUp | MediaCmd::VolumeDown)) => {
@@ -201,7 +293,7 @@ mod tests {
             announcement: false,
         };
         assert_eq!(
-            media_actions(r, PlayState::Idle, Some(0.2)),
+            media_actions(r, PlayState::Idle, Some(0.2), false),
             [
                 MediaAction::PlayMusic("http://m".into()),
                 MediaAction::SetVolume(0.4),
@@ -218,14 +310,14 @@ mod tests {
             ..MediaRequest::default()
         };
         assert_eq!(
-            media_actions(r, PlayState::Playing, None),
+            media_actions(r, PlayState::Playing, None, true),
             [MediaAction::Announce("http://a".into())]
         );
     }
 
     #[test]
     fn commands_map_to_player_actions() {
-        let one = |cmd, music| media_actions(req(Some(cmd)), music, Some(0.5));
+        let one = |cmd, music| media_actions(req(Some(cmd)), music, Some(0.5), false);
         assert_eq!(
             one(MediaCmd::Pause, PlayState::Playing),
             [MediaAction::Pause]
@@ -248,7 +340,7 @@ mod tests {
             [MediaAction::SetMuted(false)]
         );
         assert!(one(MediaCmd::Other, PlayState::Idle).is_empty());
-        assert!(media_actions(req(None), PlayState::Idle, None).is_empty());
+        assert!(media_actions(req(None), PlayState::Idle, None, false).is_empty());
     }
 
     #[test]
@@ -265,15 +357,22 @@ mod tests {
         let close = |got: Vec<f32>, want: &[f32]| {
             got.len() == want.len() && got.iter().zip(want).all(|(g, w)| (g - w).abs() < 1e-6)
         };
-        assert!(media_actions(req(Some(MediaCmd::VolumeUp)), PlayState::Idle, None).is_empty());
-        let down = media_actions(req(Some(MediaCmd::VolumeDown)), PlayState::Idle, Some(0.5));
+        assert!(
+            media_actions(req(Some(MediaCmd::VolumeUp)), PlayState::Idle, None, false).is_empty()
+        );
+        let down = media_actions(
+            req(Some(MediaCmd::VolumeDown)),
+            PlayState::Idle,
+            Some(0.5),
+            false,
+        );
         assert!(close(volumes(&down), &[0.45]), "{down:?}");
         let r = MediaRequest {
             command: Some(MediaCmd::VolumeUp),
             volume: Some(f32::NAN),
             ..MediaRequest::default()
         };
-        let up = media_actions(r, PlayState::Idle, Some(0.9));
+        let up = media_actions(r, PlayState::Idle, Some(0.9), false);
         assert!(close(volumes(&up), &[0.0, 0.05]), "{up:?}");
     }
 
@@ -309,12 +408,57 @@ mod tests {
 
     #[test]
     fn announcing_wins_over_music() {
-        assert_eq!(shown_state(true, PlayState::Playing), Shown::Announcing);
-        assert_eq!(shown_state(false, PlayState::Loading), Shown::Playing);
-        assert_eq!(shown_state(false, PlayState::Playing), Shown::Playing);
-        assert_eq!(shown_state(false, PlayState::Paused), Shown::Paused);
-        assert_eq!(shown_state(false, PlayState::Error), Shown::Idle);
-        assert_eq!(shown_state(false, PlayState::Idle), Shown::Idle);
+        assert_eq!(
+            shown_state(true, PlayState::Playing, true),
+            Shown::Announcing
+        );
+        assert_eq!(
+            shown_state(false, PlayState::Loading, false),
+            Shown::Playing
+        );
+        assert_eq!(
+            shown_state(false, PlayState::Playing, false),
+            Shown::Playing
+        );
+        assert_eq!(shown_state(false, PlayState::Paused, false), Shown::Paused);
+        assert_eq!(shown_state(false, PlayState::Error, false), Shown::Idle);
+        assert_eq!(shown_state(false, PlayState::Idle, false), Shown::Idle);
+    }
+
+    #[test]
+    fn sendspin_shows_as_playing_unless_announcing() {
+        for music in [PlayState::Idle, PlayState::Paused, PlayState::Error] {
+            assert_eq!(shown_state(false, music, true), Shown::Playing, "{music:?}");
+        }
+        assert_eq!(shown_state(true, PlayState::Idle, true), Shown::Announcing);
+    }
+
+    #[test]
+    fn ha_playback_and_its_pause_or_stop_take_the_speaker_from_sendspin() {
+        let one = |cmd, music| media_actions(req(Some(cmd)), music, Some(0.5), true);
+        use MediaAction::*;
+        assert_eq!(
+            one(MediaCmd::Pause, PlayState::Idle),
+            [LeaveSendspin, Pause]
+        );
+        assert_eq!(one(MediaCmd::Pause, PlayState::Playing), [Pause]);
+        assert_eq!(one(MediaCmd::Stop, PlayState::Idle), [Stop, LeaveSendspin]);
+        assert_eq!(one(MediaCmd::Toggle, PlayState::Idle), [LeaveSendspin]);
+        assert_eq!(one(MediaCmd::Toggle, PlayState::Playing), [Pause]);
+        assert_eq!(
+            one(MediaCmd::Play, PlayState::Paused),
+            [LeaveSendspin, Resume]
+        );
+        assert_eq!(one(MediaCmd::Play, PlayState::Idle), [Resume]);
+        assert_eq!(one(MediaCmd::Mute, PlayState::Idle), [SetMuted(true)]);
+        let url = MediaRequest {
+            url: Some("http://m".into()),
+            ..MediaRequest::default()
+        };
+        assert_eq!(
+            media_actions(url, PlayState::Idle, None, true),
+            [LeaveSendspin, PlayMusic("http://m".into())]
+        );
     }
 
     #[test]
@@ -324,6 +468,74 @@ mod tests {
         assert_eq!(channel_gains(true, false), g(0.0, 0.0));
         assert_eq!(channel_gains(false, true), g(DUCK_GAIN, 1.0));
         assert_eq!(channel_gains(false, false), g(1.0, 1.0));
+    }
+
+    fn change(volume: f32, settled: bool, unmute: bool) -> VolumeChange {
+        VolumeChange {
+            volume,
+            settled,
+            unmute,
+        }
+    }
+
+    #[test]
+    fn own_volume_requests_are_reported_and_only_knob_turns_unmute() {
+        let mut v = VolumeSync::default();
+        assert_eq!(v.shown(), None);
+        assert_eq!(v.on_report(0.26, 0), change(0.26, true, false));
+        assert_eq!(v.on_report(0.3, 20), change(0.3, true, true));
+        v.request(0.3, 100);
+        assert_eq!(
+            v.on_report(0.3, 110),
+            change(0.3, true, false),
+            "unchanged request"
+        );
+        assert_eq!(
+            v.on_report(0.31, 300),
+            change(0.31, true, true),
+            "knob right after it"
+        );
+    }
+
+    #[test]
+    fn a_sendspin_stream_start_stops_any_ha_music() {
+        for music in [
+            PlayState::Loading,
+            PlayState::Playing,
+            PlayState::Paused,
+            PlayState::Error,
+        ] {
+            assert!(sendspin_stops_music(true, music), "{music:?}");
+            assert!(!sendspin_stops_music(false, music), "{music:?}");
+        }
+        assert!(!sendspin_stops_music(true, PlayState::Idle));
+    }
+
+    #[test]
+    fn steps_on_the_way_to_a_request_are_shown_but_not_reported() {
+        let mut v = VolumeSync::default();
+        v.on_report(0.2, 0);
+        v.request(0.3, 100);
+        v.request(0.4, 110);
+        assert_eq!(v.on_report(0.3, 120), change(0.3, false, false));
+        assert_eq!(v.shown(), Some(0.3));
+        assert_eq!(v.on_report(0.4, 130), change(0.4, true, false));
+        assert_eq!(v.on_report(0.45, 600), change(0.45, true, true));
+    }
+
+    #[test]
+    fn a_request_that_never_comes_back_expires() {
+        let mut v = VolumeSync::default();
+        v.on_report(0.2, 0);
+        v.request(0.5, 0);
+        assert_eq!(
+            v.on_report(0.25, VOLUME_CONFIRM_MS),
+            change(0.25, true, true)
+        );
+        assert_eq!(
+            v.on_report(0.5, VOLUME_CONFIRM_MS + 10),
+            change(0.5, true, true)
+        );
     }
 
     #[test]

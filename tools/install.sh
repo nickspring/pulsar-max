@@ -2,7 +2,7 @@
 # Install, update or remove pulsar-max on a Station Max over root ssh (docs/architecture.md,
 # "Автозапуск").
 #   tools/install.sh <station>                    install or update from build/ (run make first)
-#   tools/install.sh --uninstall <station>        back to stock; keeps /data/pulsar-max/api.key
+#   tools/install.sh --uninstall <station>        back to stock; keeps the HA and Sendspin keys
 #   tools/install.sh --uninstall --purge <station>
 # PORT (default 2222) and SSH_OPTS are passed to ssh.
 set -eu
@@ -109,7 +109,7 @@ uninstall() {
   if [ $purge = 1 ]; then
     st "rm -rf $D"
   else
-    st "cd $D 2>/dev/null || exit 0; for f in *; do [ \"\$f\" = api.key ] || rm -rf \"\$f\"; done"
+    st "cd $D 2>/dev/null || exit 0; for f in *; do case \"\$f\" in api.key|sendspin) ;; *) rm -rf \"\$f\" ;; esac; done"
   fi
   echo "removed; Alice has the microphone again"
 }

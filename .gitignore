@@ -3,6 +3,7 @@
 /probes/java/build/
 /probes/c/build/
 /android/helper/build/
+/third_party/sendspin-cpp/src/
 *.dex
 
 # Proprietary firmware copies and station recordings stay local.

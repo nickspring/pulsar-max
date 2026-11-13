@@ -18,8 +18,15 @@ pulsar поддерживает Buildroot-станции (Миди, Лайт 2, 
 звонят и останавливаются кнопкой, щелчки крутилки приходят в HA событиями `volume_up` и
 `volume_down`. Ключевое слово «Алиса» распознаётся на станции спотером стока:
 начинает диалог, перебивает ответ и останавливает звонок таймера. Кольцо показывает состояния
-голоса анимациями стока. Установщик ставит демон с автозапуском и откатом. План —
+голоса анимациями стока. Станция — Sendspin-плеер для Music Assistant (проверен тестовым
+сервером, см. «Music Assistant»). Установщик ставит демон с автозапуском и откатом. План —
 [docs/architecture.md](docs/architecture.md#этапы).
+
+Zigbee не поддерживается. Радио станции работает на прошивке шлюза Яндекса со своим протоколом
+(Telink zbhci с расширениями Яндекса), который ZHA и Zigbee2MQTT не понимают, а координатор сети —
+`io.sdk`, умный дом Яндекса. Чтобы отдать радио HA, его пришлось бы перепрошить своей прошивкой
+координатора: все устройства пришлось бы привязывать заново, а умный дом Яндекса их потеряет. Такая
+прошивка для модуля Макс не проверена. Подробности — [docs/max.md](docs/max.md#zigbee).
 
 ## Требования
 
@@ -32,11 +39,12 @@ pulsar поддерживает Buildroot-станции (Миди, Лайт 2, 
 ```sh
 brew install rustup                   # тулчейн берётся из rust-toolchain.toml
 brew install --cask android-ndk       # или NDK=<путь> для make
+brew install cmake                    # sendspin-cpp; первый make скачивает его исходники (git)
 # помощники: JDK 17 и Android SDK (platforms/android-33, build-tools/36.0.0) в ANDROID_HOME
 # или ~/Library/Android/sdk
 make                                  # build/pulsar-max (aarch64-linux-android, API 28) и build/helper.dex
-make check                            # fmt, clippy -D warnings, тесты max-core, max-wake, помощников,
-                                      # супервизора и ctl.sh на хосте
+make check                            # fmt, clippy -D warnings, тесты max-core, max-wake,
+                                      # pulsar-sendspin, помощников, супервизора и ctl.sh на хосте
 ```
 
 ## Установка
@@ -45,7 +53,7 @@ make check                            # fmt, clippy -D warnings, тесты max-
 make
 tools/install.sh 192.168.1.50                    # установка или обновление; запускается и после перезагрузки
 ssh -p 2222 root@192.168.1.50 sh /data/pulsar-max/ctl.sh status   # enable|disable|restart|rollback|log
-tools/install.sh --uninstall 192.168.1.50        # вернуть станцию Алисе (--uninstall --purge: и ключ HA)
+tools/install.sh --uninstall 192.168.1.50        # вернуть станцию Алисе (--purge: и ключи HA и Sendspin)
 ```
 
 Установщик кладёт демон в `/data/pulsar-max` и один файл `/odm/etc/init/pulsar-max.rc`: после
@@ -58,6 +66,27 @@ pulsar-max остаётся выключенным до `ctl.sh enable` или �
 Если ssh после каждой перезагрузки жалуется на смену ключа хоста, у absshd нет каталога для
 ключа: `mkdir -m 700 /data/local/tmp/absshd` на станции (docs/max.md, «Платформа»).
 
+## Music Assistant
+
+Станция объявляет себя в сети Sendspin-плеером «Яндекс Станция Макс» (порт 8928), и Music
+Assistant с поддержкой Sendspin должен находить её сам. Проверено тестовым сервером на aiosendspin
+10.2.1 — той же библиотеке, что в Music Assistant начиная с 2.10.7; с самим Music Assistant 2.10.7
+и новее ещё не проверялось. Music Assistant 2.10.2 (aiosendspin 9.1.1) к станции не подключается:
+рукопожатие не проходит (docs/max.md, «Проверено»). Громкость плеера в MA — это громкость станции,
+та же, что у крутилки; поворот крутилки снимает mute. Пока говорит голосовой ассистент, музыка
+приглушается. Музыка из HA (URL,
+пауза, стоп) забирает станцию у Sendspin, и наоборот.
+
+По умолчанию станция принимает Sendspin-подключения без сопряжения, как pulsar. Чтобы требовать
+сопряжение:
+
+```sh
+ssh -p 2222 root@192.168.1.50 'echo 0 > /data/pulsar-max/sendspin/unpaired_access; sh /data/pulsar-max/ctl.sh restart'
+```
+
+Код и токен сопряжения пишутся в журнал (`ctl.sh log`); если сервер просит подтверждения на
+станции, нажмите кнопку Алисы.
+
 ## Структура
 
 | Путь | Что |
@@ -66,12 +95,14 @@ pulsar-max остаётся выключенным до `ctl.sh enable` или �
 | `crates/max-core` | логика без ввода-вывода: диалог, децимация 48 → 16 кГц, протокол помощников, медиа, кольцо (проигрыватель шаблонов `.led` стока); тестируется на хосте |
 | `crates/max-wake` | спотер «Алиса» стока: признаки, решение `chen14`, частотный фильтр; модель — со станции; тестируется на хосте |
 | `android/helper` | помощники на Java (`app_process`): захват `AudioRecord` и плеер `MediaPlayer` |
-| `third_party/pulsar-lan` | `pulsar-lan` с исправлением сборки под Android ([README](third_party/README.md)) |
+| `third_party/` | `pulsar-lan` и `pulsar-sendspin` с правками под Android, сборка sendspin-cpp ([README](third_party/README.md)) |
 | `deploy/` | на станцию: `supervise.sh`, `ctl.sh`, `pulsar-max.rc`; `test.sh` — их тесты на компьютере |
 | `tools/install.sh` | установка, обновление и удаление по ssh |
-| `probes/` | пробы железа: захват звука (Java через `app_process`), разбор записи, захват кнопок (`c/evgrab.c`), загрузка модели через `libtflite.so` (`c/tflite_check.c`); эталоны спотера и шаблонов кольца на Python (`spotter/`, `ledpattern/`) |
+| `probes/` | пробы железа: захват звука (Java через `app_process`), разбор записи, захват кнопок (`c/evgrab.c`), загрузка модели через `libtflite.so` (`c/tflite_check.c`), отметки времени и задержка AAudio (`c/aaudio_check.c`); эталоны спотера и шаблонов кольца на Python (`spotter/`, `ledpattern/`) |
 | `docs/` | факты о станции и архитектура |
 
 ## Лицензия
 
-AGPL-3.0-only, как у pulsar, на котором проект основан.
+AGPL-3.0-only, как у pulsar, на котором проект основан. Сторонние библиотеки, которые скачиваются
+при сборке и входят в бинарь, распространяются под своими лицензиями: sendspin-cpp, ArduinoJson,
+noise-c, IXWebSocket, micro-flac, micro-opus, micro-ogg-demuxer, libopus.

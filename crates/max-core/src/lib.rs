@@ -11,6 +11,7 @@ pub mod input;
 pub mod ledpattern;
 pub mod media;
 pub mod mic;
+pub mod music_out;
 pub mod package;
 pub mod pcm;
 pub mod player_proto;

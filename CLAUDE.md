@@ -11,20 +11,23 @@ the device live in `docs/max.md`; target design and stages in `docs/architecture
 
 Homebrew `rustup` is keg-only; the Makefile puts `/opt/homebrew/opt/rustup/bin` on PATH, plain
 `cargo` calls in a shell need it too. The NDK is auto-detected (`ANDROID_NDK_HOME`, Homebrew cask,
-SDK); override with `make NDK=<path>`.
+SDK); override with `make NDK=<path>`. The first `make` also needs `cmake` and network: it fetches
+the pinned sendspin-cpp sources into `third_party/sendspin-cpp/src/` and builds them with the NDK's
+CMake toolchain into `build/sendspin-cpp/` (`make distclean` forgets the sources).
 
 ```sh
 make                      # build/pulsar-max (+ .debug, aarch64-linux-android API 28) and build/helper.dex
                           # (helpers need JDK 17 and the Android SDK: platforms/android-33, build-tools/36.0.0)
-make check                # cargo fmt --check, clippy -D warnings (Android target + max-core, max-wake on host), tests
-make test                 # cargo test -p max-core -p max-wake (host)
+make check                # cargo fmt --check, clippy -D warnings (Android target + host crates), tests
+make test                 # cargo test -p max-core -p max-wake -p pulsar-sendspin (host; Sendspin as a stub)
 make test-deploy          # deploy/test.sh: supervise.sh and ctl.sh against a fake daemon (host)
 tools/install.sh <station>               # install/update from build/ (writes /odm/etc/init/pulsar-max.rc once)
-tools/install.sh --uninstall <station>   # back to stock, keeps api.key (add --purge to remove it)
+tools/install.sh --uninstall <station>   # back to stock, keeps api.key and sendspin/ (--purge removes them)
 cargo --locked test -p max-core identity::tests::name_from_sysfs_line   # single test
 probes/java/build.sh      # Java probe -> probes/java/build/classes.dex (JDK 17, SDK android-33, d8)
 probes/c/build.sh         # C probes (NDK clang) -> probes/c/build/; evgrab <dev> <sec> tests EVIOCGRAB,
-                          # tflite_check <lib> <model> loads a model the way io.sdk does and times it
+                          # tflite_check <lib> <model> loads a model the way io.sdk does and times it,
+                          # aaudio_check [sec] [low] plays silence and prints AAudio timestamps/latency
 python3 -I probes/analyze_capture.py <file.raw> 16 [rate] [tone_hz] ["a-b,c-d"]   # per-channel levels
 ```
 
@@ -67,18 +70,23 @@ and restore it as above.
 - **Workspace split.** `crates/max-core` (dialog, audio, helper protocol, media) and
   `crates/max-wake` (spotter) hold all logic without IO and without pulsar crates, so they build
   and are tested on the macOS host. `crates/pulsar-max` is the Android-only daemon (glue, IO,
-  `sys.rs`/`tflite.rs` FFI); it depends on `pulsar-lan`, which uses netlink and does not build off
-  Linux. New logic goes into the host crates with tests; the daemon stays thin.
-- **pulsar as a dependency.** `pulsar-core`, `pulsar-esphome`, `pulsar-lan` come from the pulsar
-  git tag in `Cargo.toml` (`[workspace.dependencies]`). External deps are pinned exactly to the
-  versions of `satellite/Cargo.toml` of that tag; when bumping the tag, re-sync the pins.
-  `pulsar-lan` is overridden by `[patch]` with `third_party/pulsar-lan` (Android build fix,
-  `third_party/README.md`); keep that copy's diff minimal and drop it once upstream has the fix.
+  `sys.rs`/`tflite.rs`/`aaudio.rs` FFI); it depends on `pulsar-lan`, which uses netlink and does
+  not build off Linux. New logic goes into the host crates with tests; the daemon stays thin.
+- **pulsar as a dependency.** `pulsar-core`, `pulsar-esphome`, `pulsar-lan`, `pulsar-sendspin`
+  come from the pulsar git tag in `Cargo.toml` (`[workspace.dependencies]`). External deps are
+  pinned exactly to the versions of `satellite/Cargo.toml` of that tag; when bumping the tag,
+  re-sync the pins. `pulsar-lan` and `pulsar-sendspin` are overridden by `[patch]` with copies in
+  `third_party/` (Android build fixes; Sendspin's ALSA sink replaced by the `AudioOutput` trait,
+  `third_party/README.md`); keep their diffs minimal and drop them once upstream has the changes.
+  `pulsar-sendspin` is a workspace member so its host tests run (without sendspin-cpp).
+- **Sendspin.** `max-core/src/music_out.rs` is the player's output logic (pulsar's sink contract,
+  finish time from AAudio timestamps, gain ramp) over a `Device` trait, host-tested with a fake;
+  `crates/pulsar-max/src/{aaudio,sendspin}.rs` are the AAudio FFI and the glue.
 - **Execution model** follows pulsar's `docs/architecture.md`, "Модель исполнения": one tokio
   `current_thread` runtime with a `LocalSet`, services are actors spawned through
   `pulsar_core::actors` returning non-blocking `Clone` handles plus event receivers; blocking or
-  realtime loops run on named `std::thread`s; `unsafe` and libc only in `sys.rs`/`tflite.rs` with
-  `// SAFETY:` (enforced by `#![deny(clippy::undocumented_unsafe_blocks)]`).
+  realtime loops run on named `std::thread`s; `unsafe` and libc only in `sys.rs`/`tflite.rs`/
+  `aaudio.rs` with `// SAFETY:` (enforced by `#![deny(clippy::undocumented_unsafe_blocks)]`).
 - **Helpers.** The HAL is owned by `audioserver`; Yandex VQE runs there as a preprocessing
   effect for source `MIC`. `android/helper/MaxHelper.java` runs as root under `app_process` in two
   processes: `capture` (`AudioRecord` with `setChannelIndexMask(0xffff)`, needs a fake

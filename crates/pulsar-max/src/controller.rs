@@ -2,7 +2,7 @@ use log::{debug, info, warn};
 use max_core::audio::{apply_gain, gain_from_db};
 use max_core::dialog::{Channel, Dialog, Effects, HaTimerEvent, PlayId, Sounds, Timer, Ui, Va};
 use max_core::input::{InputAction, Keypad, Press, knob_turn};
-use max_core::media::{self, MediaAction, MediaCmd, MediaRequest, Shown};
+use max_core::media::{self, MediaAction, MediaCmd, MediaRequest, Shown, VolumeSync};
 use max_core::mic::Mics;
 use max_core::player_proto::{PlayState, PlayerEvent};
 use max_core::preroll::{self, Preroll};
@@ -13,6 +13,7 @@ use pulsar_esphome::{
     VaEvent,
 };
 use pulsar_lan::mdns::MdnsHandle;
+use pulsar_sendspin::{SendspinEvent, SendspinHandle};
 
 use crate::capture::AudioChunk;
 use crate::input::InputEvent;
@@ -55,6 +56,7 @@ pub struct Controller {
     keypad: Keypad,
     preroll: Preroll,
     wake: Option<WakeHandle>,
+    pairing_prompt: bool,
 }
 
 pub struct Fx {
@@ -66,8 +68,9 @@ pub struct Fx {
     ducked: bool,
     announcing: bool,
     muted: bool,
-    volume: Option<f32>,
+    volume: VolumeSync,
     music: PlayState,
+    sendspin: Option<SendspinHandle>,
 }
 
 impl Controller {
@@ -78,6 +81,7 @@ impl Controller {
         sounds: Sounds,
         wake: Option<WakeHandle>,
         ring: Option<RingHandle>,
+        sendspin: Option<SendspinHandle>,
     ) -> Self {
         Self {
             dialog: Dialog::new(DEFAULT_FOLLOWUP_S, sounds),
@@ -90,8 +94,9 @@ impl Controller {
                 ducked: false,
                 announcing: false,
                 muted: false,
-                volume: None,
+                volume: VolumeSync::default(),
                 music: PlayState::Idle,
+                sendspin,
             },
             mdns,
             mic_gain_db: DEFAULT_MIC_GAIN_DB,
@@ -102,6 +107,7 @@ impl Controller {
             keypad: Keypad::new(),
             preroll: Preroll::new(PREROLL_SAMPLES),
             wake,
+            pairing_prompt: false,
         }
     }
 
@@ -132,6 +138,13 @@ impl Controller {
 
     fn on_input_action(&mut self, action: Option<InputAction>) {
         match action {
+            Some(InputAction::Action(Press::Short))
+                if self.pairing_prompt
+                    && let Some(ss) = &self.fx.sendspin =>
+            {
+                self.fx.api.fire_event(EventId::Button, "action");
+                ss.confirm_pairing_window();
+            }
             Some(InputAction::Action(Press::Short)) => {
                 self.fx.api.fire_event(EventId::Button, "action");
                 self.dialog.button(&mut self.fx);
@@ -241,7 +254,16 @@ impl Controller {
             }
             PlayerEvent::State(Channel::Announce, _) | PlayerEvent::Ready => {}
             PlayerEvent::Volume { index, max } => {
-                self.fx.volume = Some(media::volume_from_index(index, max));
+                let v = media::volume_from_index(index, max);
+                let c = self.fx.volume.on_report(v, pulsar_core::now_ms());
+                if c.unmute && self.fx.muted {
+                    self.fx.set_muted(false);
+                }
+                if c.settled
+                    && let Some(ss) = &self.fx.sendspin
+                {
+                    ss.report_volume(c.volume, self.fx.muted);
+                }
                 self.fx.publish_media();
             }
         }
@@ -305,21 +327,39 @@ impl Controller {
             url: req.media_url,
             announcement: req.announcement == Some(true),
         };
-        for action in media::media_actions(req, self.fx.music, self.fx.volume) {
+        let sendspin = self.fx.sendspin_streaming();
+        for action in media::media_actions(req, self.fx.music, self.fx.volume.shown(), sendspin) {
             match action {
                 MediaAction::PlayMusic(url) => {
                     self.fx.player.play(Channel::Music, vec![url]);
                 }
                 MediaAction::Announce(url) => self.dialog.on_media_announce(url, &mut self.fx),
-                MediaAction::SetVolume(v) => {
-                    self.fx.player.set_volume(v);
-                    self.fx.foreign_draw();
-                }
+                MediaAction::SetVolume(v) => self.fx.set_volume(v),
                 MediaAction::Resume => self.fx.player.resume(Channel::Music),
                 MediaAction::Pause => self.fx.player.pause(Channel::Music),
                 MediaAction::Stop => self.fx.player.stop(Channel::Music),
                 MediaAction::SetMuted(m) => self.fx.set_muted(m),
+                MediaAction::LeaveSendspin => {
+                    if let Some(ss) = &self.fx.sendspin {
+                        ss.yield_to_local();
+                    }
+                }
             }
+        }
+        self.fx.publish_media();
+    }
+
+    pub fn on_sendspin(&mut self, ev: SendspinEvent) {
+        match ev {
+            SendspinEvent::Stream(active) => {
+                if media::sendspin_stops_music(active, self.fx.music) {
+                    self.fx.player.stop(Channel::Music);
+                }
+            }
+            SendspinEvent::Volume(v) => self.fx.set_volume(v),
+            SendspinEvent::Mute(m) => self.fx.set_muted(m),
+            SendspinEvent::PairingWindow(open) => self.pairing_prompt = open,
+            SendspinEvent::PairingCode(_) | SendspinEvent::Music(_) => return,
         }
         self.fx.publish_media();
     }
@@ -374,26 +414,45 @@ impl Fx {
         }
     }
 
+    fn sendspin_streaming(&self) -> bool {
+        self.sendspin
+            .as_ref()
+            .is_some_and(SendspinHandle::streaming)
+    }
+
     fn publish_media(&self) {
-        let st = match media::shown_state(self.announcing, self.music) {
+        let st = match media::shown_state(self.announcing, self.music, self.sendspin_streaming()) {
             Shown::Idle => MediaState::Idle,
             Shown::Playing => MediaState::Playing,
             Shown::Paused => MediaState::Paused,
             Shown::Announcing => MediaState::Announcing,
         };
         self.api
-            .publish_media(st, self.volume.unwrap_or(0.0), self.muted);
+            .publish_media(st, self.volume.shown().unwrap_or(0.0), self.muted);
     }
 
     fn apply_gains(&self) {
         let g = media::channel_gains(self.muted, self.ducked);
         self.player.set_gain(Channel::Music, g.music);
         self.player.set_gain(Channel::Announce, g.announce);
+        if let Some(ss) = &self.sendspin {
+            ss.set_duck_gain(g.music);
+        }
     }
 
     fn set_muted(&mut self, muted: bool) {
         self.muted = muted;
         self.apply_gains();
+        if let (Some(ss), Some(v)) = (&self.sendspin, self.volume.shown()) {
+            ss.report_volume(v, muted);
+        }
+    }
+
+    /// Shown once the helper reports STREAM_MUSIC back.
+    fn set_volume(&mut self, v: f32) {
+        self.player.set_volume(v);
+        self.volume.request(v, pulsar_core::now_ms());
+        self.foreign_draw();
     }
 }
 

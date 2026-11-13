@@ -12,6 +12,8 @@ CC="$NDK/toolchains/llvm/prebuilt/$HOST/bin/aarch64-linux-android28-clang"
 mkdir -p build
 for src in ./*.c; do
     name="$(basename "$src" .c)"
-    "$CC" -O2 -Wall -Wextra -Werror -o "build/$name" "$src"
+    libs=
+    case "$name" in aaudio_check) libs=-laaudio ;; esac
+    "$CC" -O2 -Wall -Wextra -Werror -o "build/$name" "$src" $libs
     echo "$(pwd)/build/$name"
 done

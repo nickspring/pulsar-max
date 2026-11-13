@@ -4,6 +4,8 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 
+#[allow(unsafe_code)]
+mod aaudio;
 mod capture;
 mod controller;
 mod helper;
@@ -11,6 +13,7 @@ mod input;
 mod player;
 mod replay;
 mod ring;
+mod sendspin;
 #[allow(unsafe_code)]
 mod sys;
 #[allow(unsafe_code)]
@@ -28,10 +31,13 @@ use std::time::Duration;
 
 use log::{error, info, warn};
 use max_core::identity::{self, FRIENDLY_NAME, MANUFACTURER, MODEL_NAME, PLATFORM};
+use max_core::player_proto::PlayerEvent;
 use pulsar_core::actors;
 use pulsar_esphome::{ApiConfig, DeviceIdentity, WakeWordInfo};
 use pulsar_lan::mdns::{self, MdnsService};
+use pulsar_sendspin::SendspinConfig;
 use tokio::signal::unix::{Signal, SignalKind, signal};
+use tokio::sync::mpsc::UnboundedReceiver;
 
 use controller::{Controller, Flow, MUSIC_STYLES, Tick};
 use max_core::dialog::Sounds;
@@ -48,6 +54,8 @@ const BUILD_TIME: &str = match option_env!("PULSAR_MAX_BUILD_TIME") {
 const DEFAULT_DATA_DIR: &str = "/data/pulsar-max";
 const API_PORT: u16 = 6053;
 pub(crate) const ESPHOME_SERVICE: &str = "_esphomelib._tcp";
+const SENDSPIN_PORT: u16 = 8928;
+const SENDSPIN_SERVICE: &str = "_sendspin._tcp";
 const ALERT_FILE: &str = "timer_alert.wav";
 const WAKE_WORD_ID: &str = "alisa";
 pub(crate) const WAKE_PHRASE: &str = "Алиса";
@@ -55,6 +63,7 @@ const SPOTTER_CATALOG: &str = "/data/data/com.yandex.io.sdk/files/data/data/spot
 const SPOTTER_KIND: &str = "activation/alisa";
 const STOCK_SOUNDS: &str = "/data/data/com.yandex.io.sdk/files/system/sounds/common";
 const TEARDOWN_SECS: u64 = 5;
+const FIRST_VOLUME_WAIT: Duration = Duration::from_secs(3);
 
 fn main() -> ExitCode {
     let arg = std::env::args_os().nth(1);
@@ -80,6 +89,7 @@ fn main() -> ExitCode {
     let data_dir = arg.map_or_else(|| PathBuf::from(DEFAULT_DATA_DIR), PathBuf::from);
 
     pulsar_core::init_logger();
+    pulsar_core::add_own_target("max_core");
     let platform = sys::system_property(c"ro.yndx.quasar.platform");
     if platform != PLATFORM {
         error!("not a Station Max: ro.yndx.quasar.platform={platform:?}");
@@ -133,6 +143,20 @@ fn device_identity() -> DeviceIdentity {
 async fn run(data_dir: &Path) -> u8 {
     let id = device_identity();
     let name = id.name.clone();
+    let ss_cfg = SendspinConfig {
+        name: id.friendly_name.clone(),
+        product_name: id.model.clone(),
+        manufacturer: id.manufacturer.clone(),
+        software_version: id.project_version.clone(),
+        mac: id.mac.to_ascii_lowercase(),
+        state_dir: data_dir.join("sendspin"),
+        output: sendspin::output(),
+        port: SENDSPIN_PORT,
+    };
+    let ss_txt = vec![
+        "path=/sendspin".to_owned(),
+        format!("name={}", id.friendly_name),
+    ];
     let spotter = load_spotter().map_err(|e| warn!("wake word off: {e}")).ok();
     let wake_ids: Vec<String> = spotter.iter().map(|_| WAKE_WORD_ID.to_owned()).collect();
     let cfg = ApiConfig {
@@ -195,6 +219,29 @@ async fn run(data_dir: &Path) -> u8 {
     let dex = helper::dex_path();
     let sounds = sounds(data_dir);
     let (player, mut player_events) = player::spawn(dex.clone());
+    // A server gets the volume at connect: start with STREAM_MUSIC, not a placeholder.
+    let mut early_player = Vec::new();
+    let volume = first_volume(&mut player_events, &mut early_player).await;
+    if volume.is_none() {
+        warn!("STREAM_MUSIC volume unknown, Sendspin starts at 0");
+    }
+    let (sendspin, mut ss_events, _no_sendspin) =
+        match pulsar_sendspin::spawn(ss_cfg, volume.unwrap_or(0.0), false, 1.0) {
+            Ok((h, rx)) => (Some(h), rx, None),
+            Err(e) => {
+                error!("Sendspin player unavailable: {e}");
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                (None, rx, Some(tx))
+            }
+        };
+    if let (Some(m), Some(_)) = (&mdns, &sendspin) {
+        m.add_service(MdnsService {
+            service: SENDSPIN_SERVICE.into(),
+            instance: name.clone(),
+            port: SENDSPIN_PORT,
+            txt: ss_txt,
+        });
+    }
     let mic_taken = yandex::take_mic();
     let (wake, wake_audio, mut wake_events, _no_wake) = match spotter {
         Some(s) => {
@@ -209,7 +256,10 @@ async fn run(data_dir: &Path) -> u8 {
     let (capture, mut audio) = capture::spawn(dex, wake_audio);
     let (_input, mut keys) = input::spawn();
     let ring = ring::spawn();
-    let mut ctl = Controller::new(api, player, mdns, sounds, wake, ring);
+    let mut ctl = Controller::new(api, player, mdns, sounds, wake, ring, sendspin);
+    for ev in early_player {
+        ctl.on_player(ev);
+    }
     ctl.publish_all();
     info!("pulsar-max {VERSION} running as {name}");
 
@@ -234,6 +284,7 @@ async fn run(data_dir: &Path) -> u8 {
             Some(ev) = player_events.recv() => ctl.on_player(ev),
             Some(chunk) = audio.recv() => ctl.on_audio(chunk),
             Some(ev) = wake_events.recv() => ctl.on_wake(ev),
+            Some(ev) = ss_events.recv() => ctl.on_sendspin(ev),
             _ = term.recv() => break,
             _ = int.recv() => break,
             _ = hup.recv() => break,
@@ -248,6 +299,31 @@ async fn run(data_dir: &Path) -> u8 {
         restored.store(true, Ordering::Relaxed);
     }
     0
+}
+
+async fn first_volume(
+    events: &mut UnboundedReceiver<PlayerEvent>,
+    early: &mut Vec<PlayerEvent>,
+) -> Option<f32> {
+    let wait = async {
+        while let Some(ev) = events.recv().await {
+            let volume = match ev {
+                PlayerEvent::Volume { index, max } => {
+                    Some(max_core::media::volume_from_index(index, max))
+                }
+                _ => None,
+            };
+            early.push(ev);
+            if volume.is_some() {
+                return volume;
+            }
+        }
+        None
+    };
+    tokio::time::timeout(FIRST_VOLUME_WAIT, wait)
+        .await
+        .ok()
+        .flatten()
 }
 
 /// io.sdk's own model, read in place: its files may not leave the station (docs/max.md).

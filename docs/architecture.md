@@ -6,7 +6,7 @@
 
 | Процесс | Что делает |
 |---|---|
-| `pulsar-max` (Rust, root, `aarch64-linux-android`) | ESPHome API и mDNS из крейтов pulsar, контроллер голоса и плеера, кольцо (`fb5`), кнопки (evdev) |
+| `pulsar-max` (Rust, root, `aarch64-linux-android`) | ESPHome API и mDNS из крейтов pulsar, контроллер голоса и плеера, плеер Sendspin (вывод AAudio), кольцо (`fb5`), кнопки (evdev) |
 | `MaxHelper capture` (Java, root, `app_process`) | `AudioRecord` 16 каналов 48 кГц с VQE `audioserver`, отдаёт выбранные каналы демону по pipe |
 | `MaxHelper player` (Java, root, `app_process`) | Android `MediaPlayer`: URL ответов, объявлений и музыки из HA; громкость `STREAM_MUSIC` |
 
@@ -20,7 +20,7 @@
 Модель исполнения демона — как в pulsar
 ([architecture.md pulsar, «Модель исполнения»](https://github.com/Morvex885/pulsar/blob/v0.6.1/docs/architecture.md#модель-исполнения)):
 один рантайм tokio `current_thread` и `LocalSet`, сервисы — акторы с неблокирующими handle,
-`unsafe` и libc — только в `sys.rs` и `tflite.rs`.
+`unsafe` и libc — только в `sys.rs`, `tflite.rs` и `aaudio.rs`.
 
 ## Протокол помощников
 
@@ -43,7 +43,7 @@
 | `ready` | помощник готов принимать команды |
 | `state <канал> <idle\|loading\|playing\|paused\|error>` | |
 | `done <id> <0\|1>` | ровно один раз на `play`: 1 — все URL доиграли; 0 — ошибка, `stop` или замена |
-| `volume <индекс> <максимум>` | при старте и при каждом изменении `STREAM_MUSIC` (в том числе крутилкой); если `IAudioService` недоступен — не приходит, а команда `volume` игнорируется |
+| `volume <индекс> <максимум>` | при старте, при каждом изменении `STREAM_MUSIC` (в том числе крутилкой) и в ответ на каждую команду `volume`, даже без изменения; если `IAudioService` недоступен — не приходит, а команда `volume` игнорируется |
 
 ## Сосуществование со стеком Яндекса
 
@@ -116,10 +116,34 @@ pulsar-esphome не даёт снять выбор с единственного
 ответам и объявлениям звонок уступает и потом продолжается. Если `timer.wav` нет, звонит
 сгенерированный сигнал `timer_alert.wav` в каталоге данных.
 
+## Sendspin (Music Assistant)
+
+Плеер — крейт `pulsar-sendspin` pulsar на библиотеке sendspin-cpp (копия с выводом через трейт,
+[third_party/README.md](../third_party/README.md)): WebSocket-сервер на порту 8928, mDNS
+`_sendspin._tcp` с TXT `path=/sendspin` и `name=`, роли и форматы как у pulsar. Ключи и
+сопряжение — в `/data/pulsar-max/sendspin/`; без сопряжения подключиться может любой сервер, как в
+pulsar (`unpaired_access`), код и токен сопряжения пишутся в лог, кнопка Алисы подтверждает окно
+сопряжения.
+
+Звук идёт в AAudio (`max-core/src/music_out.rs` и `aaudio.rs`): usage `MEDIA`, то есть громкость
+`STREAM_MUSIC`, общая с крутилкой и плеером HA. Время, когда записанное доиграет (по нему библиотека
+держит синхронизацию), — по отметке времени AAudio, а пока её нет — по позиции чтения микшера плюс
+замеренная задержка (docs/max.md, «Звук»).
+
+Громкость Sendspin — это `STREAM_MUSIC` в обе стороны (команда `volume` помощника и его событие
+`volume`). Своё изменение (из HA или от сервера) демон отличает от поворота крутилки по ответу
+помощника на команду; поворот крутилки снимает mute (правило pulsar: локальная смена громкости
+снимает mute). Mute и приглушение под голосом — программное усиление вывода, как у канала музыки
+HA.
+Пока идёт поток Sendspin, медиаплеер в HA показывает «playing»; URL музыки, пауза и стоп из HA
+выводят станцию из группы Sendspin, а начало потока Sendspin останавливает музыку HA (правила
+pulsar). Визуализатор и метаданные не показываются.
+
 ## Автозапуск
 
 Установка — `tools/install.sh <адрес станции>` с компьютера по root-ssh (порт 2222) из `build/`;
-`--uninstall` возвращает станцию к стоку (`api.key` остаётся; `--uninstall --purge` удаляет и его).
+`--uninstall` возвращает станцию к стоку (`api.key` и `sendspin/` остаются; `--uninstall --purge`
+удаляет и их).
 
 | путь на станции | что |
 |---|---|
@@ -130,6 +154,7 @@ pulsar-esphome не даёт снять выбор с единственного
 | `/data/pulsar-max/supervise.sh`, `ctl.sh` | супервизор и управление |
 | `/data/pulsar-max/enabled` | пока файл есть, супервизор держит демон, иначе микрофон у `io.sdk` |
 | `/data/pulsar-max/api.key` | ключ Noise для HA |
+| `/data/pulsar-max/sendspin/` | ключи и сопряжения Sendspin |
 | `/data/pulsar-max/pulsar-max.log` | лог демона и супервизора, ротация по 1 МБ, `.1` |
 
 Правила супервизора (повторы, откат на `prev/`, возврат микрофона `io.sdk`, когда не работает и
@@ -159,4 +184,7 @@ SELinux в permissive, и только потом запускает супер�
 4. Ключевое слово «Алиса» на станции: спотер стока со своей реализацией признаков и решения. Готово.
 5. Кольцо: состояния голоса шаблонами стока. Готово; экран — по возможности.
 6. Автозапуск, установка и откат: `tools/install.sh`, супервизор, `ctl.sh`. Готово.
-7. Sendspin (Music Assistant), Zigbee-мост к `/dev/lp_uart`.
+7. Sendspin (Music Assistant): плеер на AAudio. Готово, проверено тестовым сервером; с Music
+   Assistant — после его обновления (docs/max.md, «Проверено»). Zigbee отложен: радио отдаётся HA
+   только перепрошивкой с перепривязкой устройств, умный дом Яндекса их теряет (docs/max.md,
+   «Zigbee»).
