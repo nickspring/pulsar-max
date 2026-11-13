@@ -62,7 +62,7 @@ install() {
   st "rm -rf $D/new && mkdir -p $D/new"
   st "cat > $D/new/pulsar-max && chmod 755 $D/new/pulsar-max" < build/pulsar-max
   st "cat > $D/new/helper.dex" < build/helper.dex
-  version=$(st "$D/new/pulsar-max --version" 2>&1) || version=
+  version=$(st "$D/new/pulsar-max --version 2>&1") || version=
   case "$version" in
     "pulsar-max "*) echo "new: $version" ;;
     *) st "rm -rf $D/new"; echo "the uploaded binary does not run: '$version'" >&2; exit 1 ;;
