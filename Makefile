@@ -19,7 +19,7 @@ export PULSAR_MAX_BUILD_TIME := $(shell LC_ALL=C git log -1 --format=%cd --date=
 CARGO_ANDROID := cargo --locked
 BIN := target/$(TARGET)/release/pulsar-max
 
-.PHONY: all check fmt clippy test test-helper clean ndk
+.PHONY: all check fmt clippy test test-helper test-deploy clean ndk
 
 all: build/pulsar-max build/helper.dex
 
@@ -37,7 +37,7 @@ build/helper.dex: android/helper/build.sh $(wildcard android/helper/*.java andro
 	@mkdir -p build
 	cp android/helper/build/helper.dex $@
 
-check: fmt clippy test test-helper
+check: fmt clippy test test-helper test-deploy
 
 fmt:
 	cargo fmt --all --check
@@ -52,6 +52,9 @@ test:
 # build.sh runs the helper's host tests before it builds the dex.
 test-helper:
 	android/helper/build.sh
+
+test-deploy:
+	sh deploy/test.sh
 
 clean:
 	cargo clean

@@ -15,14 +15,16 @@ pulsar поддерживает Buildroot-станции (Миди, Лайт 2, 
 объявления (`assist_satellite.announce`) и диалог, начатый из HA
 (`assist_satellite.start_conversation`): вопрос распознаётся, ответ звучит со станции. Кнопка
 Алисы начинает и отменяет диалог со звуками стока, кнопка микрофонов его запрещает, таймеры HA
-звонят и останавливаются кнопкой. Ключевое слово «Алиса» распознаётся на станции спотером стока:
+звонят и останавливаются кнопкой, щелчки крутилки приходят в HA событиями `volume_up` и
+`volume_down`. Ключевое слово «Алиса» распознаётся на станции спотером стока:
 начинает диалог, перебивает ответ и останавливает звонок таймера. Кольцо показывает состояния
-голоса анимациями стока. Автозапуска пока нет. План —
+голоса анимациями стока. Установщик ставит демон с автозапуском и откатом. План —
 [docs/architecture.md](docs/architecture.md#этапы).
 
 ## Требования
 
-- Яндекс Станция Макс с root через `/odm` (init-сервисы в `/odm/etc/init`), доступ по ssh.
+- Яндекс Станция Макс с root через `/odm` (init-сервисы в `/odm/etc/init`, `rootd` переводит
+  SELinux в permissive после загрузки) и root-доступом по ssh на порту 2222 (absshd).
 - Прошивка, на которой проверялось: `5000000921`, `io.sdk` 3.367.25.
 
 ## Сборка
@@ -33,8 +35,28 @@ brew install --cask android-ndk       # или NDK=<путь> для make
 # помощники: JDK 17 и Android SDK (platforms/android-33, build-tools/36.0.0) в ANDROID_HOME
 # или ~/Library/Android/sdk
 make                                  # build/pulsar-max (aarch64-linux-android, API 28) и build/helper.dex
-make check                            # fmt, clippy -D warnings, тесты max-core и max-wake на хосте
+make check                            # fmt, clippy -D warnings, тесты max-core, max-wake, помощников,
+                                      # супервизора и ctl.sh на хосте
 ```
+
+## Установка
+
+```sh
+make
+tools/install.sh 192.168.1.50                    # установка или обновление; запускается и после перезагрузки
+ssh -p 2222 root@192.168.1.50 sh /data/pulsar-max/ctl.sh status   # enable|disable|restart|rollback|log
+tools/install.sh --uninstall 192.168.1.50        # вернуть станцию Алисе (--uninstall --purge: и ключ HA)
+```
+
+Установщик кладёт демон в `/data/pulsar-max` и один файл `/odm/etc/init/pulsar-max.rc`: после
+перезагрузки демон стартует сам, через несколько секунд после загрузки системы. Пять падений
+подряд — откат на предыдущую версию; если не работает и она, микрофон возвращается Алисе, а
+pulsar-max остаётся выключенным до `ctl.sh enable` или новой установки. Демон
+забирает микрофон у Алисы; `ctl.sh disable` и удаление возвращают его. Подробности —
+[docs/architecture.md, «Автозапуск»](docs/architecture.md#автозапуск).
+
+Если ssh после каждой перезагрузки жалуется на смену ключа хоста, у absshd нет каталога для
+ключа: `mkdir -m 700 /data/local/tmp/absshd` на станции (docs/max.md, «Платформа»).
 
 ## Структура
 
@@ -45,6 +67,8 @@ make check                            # fmt, clippy -D warnings, тесты max-
 | `crates/max-wake` | спотер «Алиса» стока: признаки, решение `chen14`, частотный фильтр; модель — со станции; тестируется на хосте |
 | `android/helper` | помощники на Java (`app_process`): захват `AudioRecord` и плеер `MediaPlayer` |
 | `third_party/pulsar-lan` | `pulsar-lan` с исправлением сборки под Android ([README](third_party/README.md)) |
+| `deploy/` | на станцию: `supervise.sh`, `ctl.sh`, `pulsar-max.rc`; `test.sh` — их тесты на компьютере |
+| `tools/install.sh` | установка, обновление и удаление по ssh |
 | `probes/` | пробы железа: захват звука (Java через `app_process`), разбор записи, захват кнопок (`c/evgrab.c`), загрузка модели через `libtflite.so` (`c/tflite_check.c`); эталоны спотера и шаблонов кольца на Python (`spotter/`, `ledpattern/`) |
 | `docs/` | факты о станции и архитектура |
 

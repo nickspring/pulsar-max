@@ -18,6 +18,9 @@ make                      # build/pulsar-max (+ .debug, aarch64-linux-android AP
                           # (helpers need JDK 17 and the Android SDK: platforms/android-33, build-tools/36.0.0)
 make check                # cargo fmt --check, clippy -D warnings (Android target + max-core, max-wake on host), tests
 make test                 # cargo test -p max-core -p max-wake (host)
+make test-deploy          # deploy/test.sh: supervise.sh and ctl.sh against a fake daemon (host)
+tools/install.sh <station>               # install/update from build/ (writes /odm/etc/init/pulsar-max.rc once)
+tools/install.sh --uninstall <station>   # back to stock, keeps api.key (add --purge to remove it)
 cargo --locked test -p max-core identity::tests::name_from_sysfs_line   # single test
 probes/java/build.sh      # Java probe -> probes/java/build/classes.dex (JDK 17, SDK android-33, d8)
 probes/c/build.sh         # C probes (NDK clang) -> probes/c/build/; evgrab <dev> <sec> tests EVIOCGRAB,
@@ -35,11 +38,12 @@ with a local copy of the station's model (kept in `dump/`, never in the repo).
 
 `cargo --locked` is used everywhere: commit `Cargo.lock` changes deliberately.
 
-Running on the station (root ssh on port 2222; absshd has no scp/sftp, so files go through
-`cat`). Everything stays in `/data/local/tmp/pulsar-max/` and is removed afterwards. The daemon
-takes the mic from io.sdk at start and gives it back on SIGTERM/SIGINT/SIGHUP/SIGQUIT or HA
-Restart; run it with `ssh -t` so Ctrl-C arrives, and always end with the restore line, which is
-harmless when nothing was taken:
+Running a test build on the station (root ssh on port 2222; absshd has no scp/sftp, so files go
+through `cat`). If pulsar-max is installed, `sh /data/pulsar-max/ctl.sh disable` first and
+`enable` afterwards: only one daemon may hold the mic and the API port. Everything stays in
+`/data/local/tmp/pulsar-max/` and is removed afterwards. The daemon takes the mic from io.sdk at
+start and gives it back on SIGTERM/SIGINT/SIGHUP/SIGQUIT or HA Restart; run it with `ssh -t` so
+Ctrl-C arrives, and always end with the restore line, which is harmless when nothing was taken:
 
 ```sh
 st() { ssh -p 2222 root@<station> "$@"; }; T=/data/local/tmp/pulsar-max
@@ -101,7 +105,7 @@ and restore it as above.
   `ledpatterns/` dir; `max-core/src/ring.rs` maps the dialog's `Ui` states to them as stock does and
   schedules output (`Output::step`); `crates/pulsar-max/src/ring.rs` only writes fb5 (bytes B, G, R)
   and waits. io.sdk still draws the knob volume on the ring: the daemon reads the knob ungrabbed
-  and leaves the ring to io.sdk for 1 s.
+  and leaves the ring to io.sdk for 1.2 s.
 - **Buttons.** `crates/pulsar-max/src/input.rs` EVIOCGRABs `gpio_keypad` (io.sdk would answer the
   action button too); `max-core/src/input.rs` decodes events and classifies presses (pulsar-hw
   timing; presses are timed in the reader thread). The knob stays with io.sdk, which drives
@@ -122,9 +126,10 @@ and restore it as above.
 - Proprietary Yandex files (APK, `.so`, configs, recordings) never enter the repo; analysis copies
   live in the gitignored `dump/` of the sibling pulsar checkout or `/tmp`.
 - No personal data in the repo: real IPs, MACs, device names with MAC suffix, serials, logs.
-- Station safety: never touch the root method in `/odm` (`rootd`, `absshd`, `adbguard.sh`,
+- Station safety: never touch the root method in `/odm` (`rootd`, `absshd`, `adbguard.sh`, its
   `/odm/etc/init/*.rc`) or `/data/local/tmp` files that are not ours; `/system` and `/vendor` are
-  dm-verity. Tests that take the mic from io.sdk must restore it (`RECORD_AUDIO allow` + `kill`),
+  dm-verity. Our only file in `/odm` is `/odm/etc/init/pulsar-max.rc`, written and removed only by
+  `tools/install.sh`. Tests that take the mic from io.sdk must restore it (`RECORD_AUDIO allow` + `kill`),
   and test files go to `/data/local/tmp/pulsar-max/` and are removed afterwards. Sound tests stay at
   volume <= 0.2 unless the owner allows more.
 - Live tests with the owner: one step at a time, every prompt in Russian, say exactly what to
