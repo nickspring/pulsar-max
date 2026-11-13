@@ -305,9 +305,11 @@ fake_daemon "$T/d/prev" old
 check "restart while disabled" "$(ctl restart > /dev/null; echo $?)" 1
 plan "0 30" "0 30"
 touch "$T/d/enabled"
+echo "mic_gain_db=12" > "$T/d/settings.conf"
 ctl rollback
 wait_for '[ -n "$(runs)" ]'
 check "rollback: prev runs" "$(runs)" old
+check "rollback: settings kept" "$(cat "$T/d/settings.conf")" "mic_gain_db=12"
 check "rollback: bad kept" "$(cat "$T/d/bad/variant")" new
 check "rollback: still enabled" "$(exists "$T/d/enabled")" yes
 ctl disable
@@ -347,11 +349,13 @@ check "activate: an unproven bin is replaced, prev kept" \
   "$(cat "$T/d/bin/variant") $(exists "$T/d/prev")" "v2 no"
 
 touch "$T/d/bin/.healthy"
+echo "mic_gain_db=7" > "$T/d/settings.conf"
 fake_daemon "$T/d/new" v3
 plan "1 0" "0 30"
 ctl activate
 wait_for '[ "$(ctl health)" != wait ]'
 check "activate: a healthy bin becomes prev" "$(cat "$T/d/prev/variant") $(cat "$T/d/bin/variant")" "v2 v3"
+check "activate: settings kept" "$(cat "$T/d/settings.conf")" "mic_gain_db=7"
 check "health: a crash fails" "$(ctl health)" fail
 ctl disable
 

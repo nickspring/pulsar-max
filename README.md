@@ -23,7 +23,9 @@ pulsar поддерживает Buildroot-станции (Миди, Лайт 2, 
 эквалайзер стока (стиль выбирается в HA: «Music visualization», по умолчанию случайный, новый на
 каждом старте воспроизведения, как у стока; у Music Assistant смена трека не прерывает поток, и
 стиль остаётся до следующего старта). Станция — Sendspin-плеер для Music Assistant (см. «Music
-Assistant»). Установщик ставит демон с автозапуском и откатом. План —
+Assistant»). Настройки из HA («Music visualization», «Voice indication», «Microphone gain»,
+«Follow-up duration», «Command start offset») хранятся на станции и переживают перезапуск и
+обновление. Установщик ставит демон с автозапуском и откатом. План —
 [docs/architecture.md](docs/architecture.md#этапы).
 
 Zigbee не поддерживается. Радио станции работает на прошивке шлюза Яндекса со своим протоколом
@@ -57,7 +59,7 @@ make check                            # fmt, clippy -D warnings, тесты max-
 make
 tools/install.sh 192.168.1.50                    # установка или обновление; запускается и после перезагрузки
 ssh -p 2222 root@192.168.1.50 sh /data/pulsar-max/ctl.sh status   # enable|disable|restart|rollback|log
-tools/install.sh --uninstall 192.168.1.50        # вернуть станцию Алисе (--purge: и ключи HA и Sendspin)
+tools/install.sh --uninstall 192.168.1.50        # вернуть станцию Алисе (--purge: и ключи HA и Sendspin, и настройки)
 ```
 
 Установщик кладёт демон в `/data/pulsar-max` и один файл `/odm/etc/init/pulsar-max.rc`: после

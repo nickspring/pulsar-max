@@ -10,6 +10,7 @@ use max_core::mic::Mics;
 use max_core::player_proto::{PlayState, PlayerEvent};
 use max_core::preroll::{self, Preroll};
 use max_core::screen::{ScreenChoice, ScreenCmd, Viz, playback_started, screen_source};
+use max_core::settings::{self, Settings};
 use pulsar_core::Timers;
 use pulsar_esphome::{
     AnnounceRequest, ApiEvent, ApiHandle, BinarySensorId, EventId, MediaCommand,
@@ -24,12 +25,10 @@ use crate::input::InputEvent;
 use crate::player::PlayerHandle;
 use crate::ring::RingHandle;
 use crate::screen::ScreenHandle;
+use crate::settings_file::SettingsFile;
 use crate::wake::WakeHandle;
 use crate::{ESPHOME_SERVICE, VERSION, WAKE_PHRASE};
 
-/// Provisional: at 1-2 m `vqe_0` speech sits near -62 dBFS (docs/max.md, "Звук").
-const DEFAULT_MIC_GAIN_DB: u32 = 24;
-const DEFAULT_FOLLOWUP_S: u32 = 10;
 /// Two seconds of 16 kHz audio: longer than the wake thread's queue, so the pre-roll is complete.
 const PREROLL_SAMPLES: usize = 32_000;
 /// pulsar's pre-roll chunking.
@@ -44,23 +43,21 @@ pub enum Flow {
 pub enum Tick {
     Dialog(Timer),
     Keypad,
+    SaveSettings,
 }
 
 pub struct Controller {
     dialog: Dialog,
     fx: Fx,
     mdns: Option<MdnsHandle>,
-    mic_gain_db: u32,
-    command_offset_ms: i32,
-    voice_indication: bool,
-    followup_s: u32,
+    settings: Settings,
+    settings_file: SettingsFile,
     mics: Mics,
     keypad: Keypad,
     preroll: Preroll,
     wake: Option<WakeHandle>,
     pairing_prompt: bool,
     ownership: MusicOwnership,
-    viz: Viz,
     screen_choice: ScreenChoice,
 }
 
@@ -82,6 +79,7 @@ pub struct Fx {
 }
 
 impl Controller {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         api: ApiHandle,
         player: PlayerHandle,
@@ -90,9 +88,14 @@ impl Controller {
         wake: Option<WakeHandle>,
         ring: Option<RingHandle>,
         sendspin: Option<SendspinHandle>,
+        settings_file: SettingsFile,
     ) -> Self {
+        let settings = settings_file.stored();
+        if let Some(r) = &ring {
+            r.set_voice_indication(settings.voice_indication);
+        }
         Self {
-            dialog: Dialog::new(DEFAULT_FOLLOWUP_S, sounds.clone()),
+            dialog: Dialog::new(settings.followup_s, sounds.clone()),
             fx: Fx {
                 api,
                 player,
@@ -110,17 +113,14 @@ impl Controller {
                 screen: None,
             },
             mdns,
-            mic_gain_db: DEFAULT_MIC_GAIN_DB,
-            command_offset_ms: 0,
-            voice_indication: true,
-            followup_s: DEFAULT_FOLLOWUP_S,
+            settings,
+            settings_file,
             mics: Mics::default(),
             keypad: Keypad::new(),
             preroll: Preroll::new(PREROLL_SAMPLES),
             wake,
             pairing_prompt: false,
             ownership: MusicOwnership::default(),
-            viz: Viz::Random,
             screen_choice: ScreenChoice::default(),
         }
     }
@@ -137,7 +137,7 @@ impl Controller {
         let source = screen_source(self.fx.music, self.fx.sendspin_streaming());
         match self
             .screen_choice
-            .update(self.viz, source, restart, random())
+            .update(self.settings.viz, source, restart, random())
         {
             Some(ScreenCmd::Show {
                 style,
@@ -233,12 +233,13 @@ impl Controller {
         api.publish_binary_sensor(BinarySensorId::HwMicMute, self.mics.hw_muted());
         api.publish_switch(SwitchId::AutoUpdate, false);
         api.publish_switch(SwitchId::NearestAnswers, false);
-        api.publish_switch(SwitchId::VoiceIndication, self.voice_indication);
-        api.publish_number(NumberId::MicGain, self.mic_gain_db as f32);
-        api.publish_number(NumberId::FollowupDuration, self.followup_s as f32);
-        api.publish_number(NumberId::CommandOffset, self.command_offset_ms as f32);
+        let s = &self.settings;
+        api.publish_switch(SwitchId::VoiceIndication, s.voice_indication);
+        api.publish_number(NumberId::MicGain, s.mic_gain_db as f32);
+        api.publish_number(NumberId::FollowupDuration, s.followup_s as f32);
+        api.publish_number(NumberId::CommandOffset, s.command_offset_ms as f32);
         api.publish_number(NumberId::LedSpeed, 1.0);
-        api.publish_select(SelectId::MusicViz, self.viz.label());
+        api.publish_select(SelectId::MusicViz, s.viz.label());
         api.publish_update(&UpdateState {
             in_progress: false,
             has_progress: false,
@@ -257,6 +258,7 @@ impl Controller {
                 let action = self.keypad.on_tick(pulsar_core::now_ms());
                 self.on_input_action(action);
             }
+            Tick::SaveSettings => self.flush_settings(),
         }
     }
 
@@ -271,7 +273,7 @@ impl Controller {
         if !self.dialog.wake(WAKE_PHRASE, &mut self.fx) {
             return;
         }
-        let start = preroll::command_start(end, self.command_offset_ms);
+        let start = preroll::command_start(end, self.settings.command_offset_ms);
         let preroll = self.preroll.since(start);
         for chunk in preroll.chunks(PREROLL_CHUNK) {
             self.send_audio(chunk.to_vec());
@@ -297,7 +299,7 @@ impl Controller {
     }
 
     fn send_audio(&self, mut samples: Vec<i16>) {
-        apply_gain(&mut samples, gain_from_db(self.mic_gain_db));
+        apply_gain(&mut samples, gain_from_db(self.settings.mic_gain_db));
         self.fx.api.voice_send_audio(samples);
     }
 
@@ -360,12 +362,13 @@ impl Controller {
             ApiEvent::Number(id, v) => self.on_number(id, v),
             ApiEvent::Select(SelectId::MusicViz, v) => {
                 if let Some(viz) = Viz::parse(&v) {
-                    self.viz = viz;
+                    self.settings.viz = viz;
+                    self.store_settings();
                     self.update_screen(false);
                 }
                 self.fx
                     .api
-                    .publish_select(SelectId::MusicViz, self.viz.label());
+                    .publish_select(SelectId::MusicViz, self.settings.viz.label());
             }
             ApiEvent::Select(id, v) => self.fx.api.publish_select(id, &v),
             ApiEvent::MdnsTxtChanged(txt) => {
@@ -459,7 +462,8 @@ impl Controller {
                 return;
             }
             SwitchId::VoiceIndication => {
-                self.voice_indication = on;
+                self.settings.voice_indication = on;
+                self.store_settings();
                 if let Some(r) = &self.fx.ring {
                     r.set_voice_indication(on);
                 }
@@ -472,24 +476,44 @@ impl Controller {
     fn on_number(&mut self, id: NumberId, v: f32) {
         match id {
             NumberId::MicGain => {
-                self.mic_gain_db = v.round() as u32;
-                self.fx.api.publish_number(id, self.mic_gain_db as f32);
-            }
-            NumberId::CommandOffset => {
-                let Some(ms) = pulsar_esphome::command_offset_ms(v) else {
+                let Some(db) = settings::mic_gain_db(v) else {
                     return;
                 };
-                self.command_offset_ms = ms;
+                self.settings.mic_gain_db = db;
+                self.fx.api.publish_number(id, db as f32);
+            }
+            NumberId::CommandOffset => {
+                let Some(ms) = settings::command_offset_ms(v) else {
+                    return;
+                };
+                self.settings.command_offset_ms = ms;
                 self.fx.api.publish_number(id, ms as f32);
             }
             NumberId::FollowupDuration => {
-                self.followup_s = v.round() as u32;
-                self.dialog
-                    .set_followup_duration(self.followup_s, &mut self.fx);
-                self.fx.api.publish_number(id, self.followup_s as f32);
+                let Some(s) = settings::followup_s(v) else {
+                    return;
+                };
+                self.settings.followup_s = s;
+                self.dialog.set_followup_duration(s, &mut self.fx);
+                self.fx.api.publish_number(id, s as f32);
             }
-            _ => self.fx.api.publish_number(id, v),
+            _ => {
+                self.fx.api.publish_number(id, v);
+                return;
+            }
         }
+        self.store_settings();
+    }
+
+    fn store_settings(&mut self) {
+        self.fx
+            .timers
+            .set(Tick::SaveSettings, settings::SAVE_DELAY_MS);
+    }
+
+    pub fn flush_settings(&mut self) {
+        self.fx.timers.cancel(Tick::SaveSettings);
+        self.settings_file.flush(&self.settings);
     }
 }
 

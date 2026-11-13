@@ -22,7 +22,7 @@ make check                # cargo fmt --check, clippy -D warnings (Android targe
 make test                 # cargo test -p max-core -p max-wake -p pulsar-sendspin (host; Sendspin as a stub)
 make test-deploy          # deploy/test.sh: supervise.sh and ctl.sh against a fake daemon (host)
 tools/install.sh <station>               # install/update from build/ (writes /odm/etc/init/pulsar-max.rc once)
-tools/install.sh --uninstall <station>   # back to stock, keeps api.key and sendspin/ (--purge removes them)
+tools/install.sh --uninstall <station>   # back to stock, keeps api.key, sendspin/, settings.conf (--purge removes them)
 cargo --locked test -p max-core identity::tests::name_from_sysfs_line   # single test
 probes/java/build.sh      # Java probe -> probes/java/build/classes.dex (JDK 17, SDK android-33, d8)
 probes/c/build.sh         # C probes (NDK clang) -> probes/c/build/; evgrab <dev> <sec> tests EVIOCGRAB,

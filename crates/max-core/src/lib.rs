@@ -19,5 +19,6 @@ pub mod player_proto;
 pub mod preroll;
 pub mod ring;
 pub mod screen;
+pub mod settings;
 pub mod spectrogram;
 pub mod spectrum_sync;

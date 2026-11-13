@@ -15,6 +15,7 @@ mod replay;
 mod ring;
 mod screen;
 mod sendspin;
+mod settings_file;
 #[allow(unsafe_code)]
 mod sys;
 #[allow(unsafe_code)]
@@ -45,6 +46,7 @@ use max_core::dialog::Sounds;
 use max_core::screen::Viz;
 use max_wake::command::CommandSpotter;
 use max_wake::spotter::Spotter;
+use settings_file::SettingsFile;
 use wake::SpotEvent;
 
 pub(crate) const VERSION: &str = match option_env!("PULSAR_MAX_VERSION") {
@@ -61,6 +63,7 @@ pub(crate) const ESPHOME_SERVICE: &str = "_esphomelib._tcp";
 const SENDSPIN_PORT: u16 = 8928;
 const SENDSPIN_SERVICE: &str = "_sendspin._tcp";
 const ALERT_FILE: &str = "timer_alert.wav";
+const SETTINGS_FILE: &str = "settings.conf";
 const WAKE_WORD_ID: &str = "alisa";
 pub(crate) const WAKE_PHRASE: &str = "Алиса";
 const SPOTTER_CATALOG: &str = "/data/data/com.yandex.io.sdk/files/data/data/spotter.json";
@@ -268,7 +271,8 @@ async fn run(data_dir: &Path) -> u8 {
     let (capture, mut audio) = capture::spawn(dex, wake_audio, screen_feed);
     let (_input, mut keys) = input::spawn();
     let ring = ring::spawn();
-    let mut ctl = Controller::new(api, player, mdns, sounds, wake, ring, sendspin);
+    let settings = SettingsFile::load(data_dir.join(SETTINGS_FILE));
+    let mut ctl = Controller::new(api, player, mdns, sounds, wake, ring, sendspin, settings);
     ctl.set_screen(screen);
     for ev in early_player {
         ctl.on_player(ev);
@@ -307,6 +311,7 @@ async fn run(data_dir: &Path) -> u8 {
             _ = quit.recv() => break,
         }
     }
+    ctl.flush_settings();
     let restored = Arc::new(AtomicBool::new(!mic_taken));
     arm_teardown_watchdog(restored.clone());
     drop(capture);
