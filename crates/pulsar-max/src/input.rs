@@ -14,7 +14,9 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use crate::sys;
 
 const KEYPAD_NAME: &str = "gpio_keypad";
+const KNOB_NAME: &str = "rotary-volume";
 const EV_SYN: u16 = 0;
+const EV_KEY: u16 = 1;
 const SYN_DROPPED: u16 = 3;
 const SW_MUTE_DEVICE: u16 = 14;
 const POLL_MS: i32 = 500;
@@ -30,23 +32,74 @@ pub enum InputEvent {
         at_ms: i64,
     },
     MicMutedState(bool),
+    /// The volume knob turned; io.sdk keeps handling it and draws the volume on the ring.
+    Knob,
 }
 
 pub struct InputHandle {
     stop: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
+    threads: Vec<JoinHandle<()>>,
 }
 
 pub fn spawn() -> (InputHandle, UnboundedReceiver<InputEvent>) {
     let (tx, rx) = unbounded_channel();
     let stop = Arc::new(AtomicBool::new(false));
-    let s = stop.clone();
-    let thread = std::thread::Builder::new()
-        .name("input".into())
-        .spawn(move || run(&s, &tx))
-        .map_err(|e| warn!("input: thread: {e}"))
-        .ok();
-    (InputHandle { stop, thread }, rx)
+    let (s, knob_stop, knob_tx) = (stop.clone(), stop.clone(), tx.clone());
+    let threads = [
+        std::thread::Builder::new()
+            .name("input".into())
+            .spawn(move || run(&s, &tx)),
+        std::thread::Builder::new()
+            .name("knob".into())
+            .spawn(move || run_knob(&knob_stop, &knob_tx)),
+    ]
+    .into_iter()
+    .filter_map(|t| t.map_err(|e| warn!("input: thread: {e}")).ok())
+    .collect();
+    (InputHandle { stop, threads }, rx)
+}
+
+fn run_knob(stop: &AtomicBool, tx: &UnboundedSender<InputEvent>) {
+    let mut failure_logged = false;
+    while !stop.load(Ordering::Relaxed) {
+        match find_device(KNOB_NAME).map(File::open) {
+            Some(Ok(mut file)) => {
+                failure_logged = false;
+                let mut buf = [0u8; EVENT_SIZE];
+                while !stop.load(Ordering::Relaxed) {
+                    match sys::wait_readable(file.as_fd(), POLL_MS) {
+                        Ok(false) => continue,
+                        Ok(true) => {}
+                        Err(_) => break,
+                    }
+                    if file.read_exact(&mut buf).is_err() {
+                        break;
+                    }
+                    if decode(&buf).kind == EV_KEY && tx.send(InputEvent::Knob).is_err() {
+                        return;
+                    }
+                }
+            }
+            Some(Err(e)) if !failure_logged => {
+                warn!("input: {KNOB_NAME}: {e}");
+                failure_logged = true;
+            }
+            None if !failure_logged => {
+                warn!("input: no {KNOB_NAME} device");
+                failure_logged = true;
+            }
+            _ => {}
+        }
+        wait_reopen(stop);
+    }
+}
+
+fn wait_reopen(stop: &AtomicBool) {
+    let mut waited = Duration::ZERO;
+    while waited < REOPEN && !stop.load(Ordering::Relaxed) {
+        std::thread::sleep(Duration::from_millis(100));
+        waited += Duration::from_millis(100);
+    }
 }
 
 fn run(stop: &AtomicBool, tx: &UnboundedSender<InputEvent>) {
@@ -76,11 +129,7 @@ fn run(stop: &AtomicBool, tx: &UnboundedSender<InputEvent>) {
             }
             _ => {}
         }
-        let mut waited = Duration::ZERO;
-        while waited < REOPEN && !stop.load(Ordering::Relaxed) {
-            std::thread::sleep(Duration::from_millis(100));
-            waited += Duration::from_millis(100);
-        }
+        wait_reopen(stop);
     }
 }
 
@@ -139,7 +188,7 @@ fn device_name(sys_dir: PathBuf) -> Option<String> {
 impl Drop for InputHandle {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(t) = self.thread.take() {
+        for t in self.threads.drain(..) {
             let _ = t.join();
         }
     }

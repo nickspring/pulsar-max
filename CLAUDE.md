@@ -30,6 +30,8 @@ Spotter references (`probes/spotter/`) need a venv with `numpy` and `ai-edge-lit
 `golden_signal.py` regenerates `crates/max-wake/tests/fixtures/`, `chen14_ref.py` prints the
 golden chen14 cases; `proto.py <capture.raw> <model.tflite>` runs the whole spotter on a recording
 with a local copy of the station's model (kept in `dump/`, never in the repo).
+`probes/ledpattern/golden_led.py` regenerates `crates/max-core/tests/fixtures/ledpattern.txt` from
+`ledref.py` (synthetic patterns only; stock `.led` files stay out of the repo).
 
 `cargo --locked` is used everywhere: commit `Cargo.lock` changes deliberately.
 
@@ -94,6 +96,12 @@ and restore it as above.
   from its APK (`crates/pulsar-max/src/tflite.rs`). The capture thread tees positioned 16 kHz
   `vqe_0`/`vqe_bnr`/raw-mic chunks to the wake thread (`wake.rs`, bounded `try_send`); a hit
   carries the stream position, and the controller sends the `Preroll` after it, then live audio.
+- **Ring.** `max-core/src/ledpattern.rs` plays io.sdk's own `.led` patterns (format and player
+  reverse-engineered, references in `probes/ledpattern/`), read in place from io.sdk's
+  `ledpatterns/` dir; `max-core/src/ring.rs` maps the dialog's `Ui` states to them as stock does and
+  schedules output (`Output::step`); `crates/pulsar-max/src/ring.rs` only writes fb5 (bytes B, G, R)
+  and waits. io.sdk still draws the knob volume on the ring: the daemon reads the knob ungrabbed
+  and leaves the ring to io.sdk for 1 s.
 - **Buttons.** `crates/pulsar-max/src/input.rs` EVIOCGRABs `gpio_keypad` (io.sdk would answer the
   action button too); `max-core/src/input.rs` decodes events and classifies presses (pulsar-hw
   timing; presses are timed in the reader thread). The knob stays with io.sdk, which drives

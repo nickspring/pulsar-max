@@ -29,6 +29,17 @@ enum Phase {
     Speaking,
 }
 
+/// pulsar's `UiState`: what the ring shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ui {
+    Idle,
+    Listening,
+    Thinking,
+    Speaking,
+    Error,
+    TimerRing,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Channel {
     Music,
@@ -44,6 +55,8 @@ pub enum Timer {
     FollowupWait,
     RingTick,
     RingTimeout,
+    /// pulsar's `UiAfterNotSubscribed`: the ring gets the real state back.
+    ErrorShown,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,6 +81,7 @@ pub const PROCESS_TIMEOUT_MS: u64 = 120_000;
 pub const FOLLOWUP_DURATION_MAX_S: u32 = 10;
 pub const RING_TICK_MS: u64 = 300;
 pub const TIMER_RING_MAX_MS: u64 = 15 * 60 * 1000;
+pub const NOT_SUBSCRIBED_ERROR_MS: u64 = 1_500;
 
 // HA's VAD sends STT_VAD_START only after 0.3 s of speech.
 const FOLLOWUP_VAD_GRACE_MS: u64 = 1000;
@@ -86,6 +100,8 @@ pub trait Effects {
     fn cancel(&mut self, timer: Timer);
     fn set_duck(&mut self, on: bool);
     fn set_announcing(&mut self, on: bool);
+    /// pulsar's ring holds `Error` for its own time and keeps it over a following `Idle`.
+    fn show(&mut self, ui: Ui);
 }
 
 /// Pipeline events carry no run id. HA ends a run it replaces with a RUN_END sent before the new
@@ -208,6 +224,9 @@ pub struct Dialog {
     ring_expired: bool,
     /// Bumped when a ring ends: the cut round's late `done` must not tick the next ring.
     ring_cycle: u64,
+    shown: Ui,
+    /// pulsar's `error_shown`: the failed dialog's later states stay off the ring.
+    error_shown: bool,
 }
 
 impl Dialog {
@@ -235,6 +254,8 @@ impl Dialog {
             ring_tick_armed: false,
             ring_expired: false,
             ring_cycle: 0,
+            shown: Ui::Idle,
+            error_shown: false,
         }
     }
 
@@ -243,6 +264,7 @@ impl Dialog {
         if self.followup_s == 0 && self.awaiting_followup_speech() {
             self.end_interaction(fx);
         }
+        self.update_ui(fx);
     }
 
     pub fn set_mic_enabled(&mut self, on: bool, fx: &mut impl Effects) {
@@ -250,29 +272,33 @@ impl Dialog {
         if !on && self.phase == Phase::Listening {
             self.end_interaction(fx);
         }
+        self.update_ui(fx);
     }
 
     pub fn button(&mut self, fx: &mut impl Effects) {
         if self.timer_ringing {
-            return self.stop_timer_ring(fx);
-        }
-        if matches!(self.phase, Phase::Listening | Phase::Processing) {
-            return self.cancel_dialog(fx);
-        }
-        if self.phase == Phase::Speaking || self.announcing {
+            self.stop_timer_ring(fx);
+        } else if matches!(self.phase, Phase::Listening | Phase::Processing) {
+            self.cancel_dialog(fx);
+        } else if self.phase == Phase::Speaking || self.announcing {
             self.interrupt_speech(fx);
-            return self.end_interaction(fx);
+            self.end_interaction(fx);
+        } else {
+            self.start("", fx);
         }
-        self.start("", fx);
+        self.update_ui(fx);
     }
 
     /// While the timer rings this only stops the ring: the wake word is a stop word then.
     pub fn start(&mut self, phrase: &str, fx: &mut impl Effects) -> bool {
-        if self.timer_ringing && self.mic_enabled {
+        let started = if self.timer_ringing && self.mic_enabled {
             self.stop_timer_ring(fx);
-            return false;
-        }
-        self.begin_dialog(phrase, true, fx)
+            false
+        } else {
+            self.begin_dialog(phrase, true, fx)
+        };
+        self.update_ui(fx);
+        started
     }
 
     /// pulsar's `on_wake`: a word heard while listening or processing is the same request, unless
@@ -334,12 +360,15 @@ impl Dialog {
             }
             Va::Error => {
                 self.stop_streaming(fx);
+                let code = get("code");
+                let silent_followup =
+                    self.followup.awaiting_speech && code == "stt-no-text-recognized";
                 // HA takes one wake word per 2 s across satellites: on a duplicate another answers.
-                if !matches!(
-                    get("code"),
-                    "duplicate_wake_up_detected" | "stt-no-text-recognized"
-                ) {
-                    self.play_closing_earcon(self.sounds.error.clone(), fx);
+                if code != "duplicate_wake_up_detected" && !silent_followup {
+                    self.show_error(fx);
+                    if code != "stt-no-text-recognized" {
+                        self.play_closing_earcon(self.sounds.error.clone(), fx);
+                    }
                 }
             }
             Va::RunEnd => {
@@ -351,6 +380,7 @@ impl Dialog {
             _ => {}
         }
         self.arm_watchdog(fx);
+        self.update_ui(fx);
     }
 
     pub fn on_start_failed(&mut self, run: u64, fx: &mut impl Effects) {
@@ -358,7 +388,7 @@ impl Dialog {
             return;
         }
         self.run.awaiting_run_start = false;
-        self.end_interaction(fx);
+        self.abort(fx);
     }
 
     /// The server already sent the stop.
@@ -367,7 +397,7 @@ impl Dialog {
             return;
         }
         self.stop_sent = true;
-        self.end_interaction(fx);
+        self.abort(fx);
     }
 
     pub fn on_link_lost(&mut self, fx: &mut impl Effects) {
@@ -384,6 +414,7 @@ impl Dialog {
         if matches!(self.phase, Phase::Listening | Phase::Processing) {
             self.end_interaction(fx);
         }
+        self.update_ui(fx);
     }
 
     pub fn on_announce(
@@ -401,6 +432,7 @@ impl Dialog {
                 seq,
             },
         );
+        self.update_ui(fx);
     }
 
     /// Media player announcement: no AnnounceFinished, HA follows the media state.
@@ -408,6 +440,7 @@ impl Dialog {
         let seq = self.begin_announce(fx);
         let id = fx.play(Channel::Announce, vec![url]);
         self.pending.insert(id, Pending::MediaAnnounce { seq });
+        self.update_ui(fx);
     }
 
     pub fn on_play_done(&mut self, id: PlayId, ok: bool, fx: &mut impl Effects) {
@@ -452,6 +485,7 @@ impl Dialog {
                 }
             }
         }
+        self.update_ui(fx);
     }
 
     /// As in pulsar, the ring belongs to no single timer, so `Cancelled` does not stop it.
@@ -460,10 +494,12 @@ impl Dialog {
             return;
         }
         self.timer_ringing = true;
+        self.error_shown = false;
         self.ring_expired = false;
         fx.arm(Timer::RingTimeout, TIMER_RING_MAX_MS);
         self.update_duck(fx);
         self.ring_timer(fx);
+        self.update_ui(fx);
     }
 
     pub fn on_timer(&mut self, timer: Timer, fx: &mut impl Effects) {
@@ -471,7 +507,7 @@ impl Dialog {
         match timer {
             Timer::Watchdog => {
                 if matches!(self.phase, Phase::Listening | Phase::Processing) {
-                    self.end_interaction(fx);
+                    self.abort(fx);
                 }
             }
             Timer::FollowupWait => {
@@ -485,7 +521,9 @@ impl Dialog {
                 }
             }
             Timer::RingTimeout => self.ring_expired = self.timer_ringing,
+            Timer::ErrorShown => self.error_shown = false,
         }
+        self.update_ui(fx);
     }
 
     fn can_listen(&self, fx: &impl Effects) -> bool {
@@ -494,6 +532,10 @@ impl Dialog {
 
     fn begin_dialog(&mut self, phrase: &str, earcon: bool, fx: &mut impl Effects) -> bool {
         if !self.can_listen(fx) {
+            if self.mic_enabled {
+                self.show_error(fx);
+                fx.arm(Timer::ErrorShown, NOT_SUBSCRIBED_ERROR_MS);
+            }
             return false;
         }
         if self.phase == Phase::Speaking || self.announcing {
@@ -505,6 +547,7 @@ impl Dialog {
 
     fn listen(&mut self, phrase: &str, earcon: bool, fx: &mut impl Effects) {
         fx.cancel(Timer::FollowupWait);
+        self.error_shown = false;
         self.phase = Phase::Listening;
         self.dialog += 1;
         self.run.start();
@@ -596,6 +639,7 @@ impl Dialog {
         self.run.awaiting_run_start = false;
         self.send_tts_report(false, fx);
         fx.set_streaming(false);
+        self.error_shown = false;
         self.phase = Phase::Idle;
         self.dialog += 1;
         self.tts_played = false;
@@ -603,6 +647,40 @@ impl Dialog {
         self.followup = Followup::default();
         self.update_duck(fx);
         self.arm_watchdog(fx);
+    }
+
+    /// A dialog that failed without a pipeline run to end it.
+    fn abort(&mut self, fx: &mut impl Effects) {
+        self.show_error(fx);
+        self.end_interaction(fx);
+        self.update_ui(fx);
+    }
+
+    fn ui(&self) -> Ui {
+        if self.timer_ringing {
+            return Ui::TimerRing;
+        }
+        match self.phase {
+            Phase::Listening => Ui::Listening,
+            Phase::Processing => Ui::Thinking,
+            Phase::Speaking => Ui::Speaking,
+            Phase::Idle if self.announcing => Ui::Speaking,
+            Phase::Idle => Ui::Idle,
+        }
+    }
+
+    fn update_ui(&mut self, fx: &mut impl Effects) {
+        let ui = self.ui();
+        if !self.error_shown && ui != self.shown {
+            self.shown = ui;
+            fx.show(ui);
+        }
+    }
+
+    fn show_error(&mut self, fx: &mut impl Effects) {
+        self.shown = Ui::Error;
+        self.error_shown = true;
+        fx.show(Ui::Error);
     }
 
     fn arm_watchdog(&self, fx: &mut impl Effects) {
@@ -645,6 +723,7 @@ impl Dialog {
     }
 
     fn begin_announce(&mut self, fx: &mut impl Effects) -> u64 {
+        self.error_shown = false;
         self.announcing = true;
         self.announce_seq += 1;
         self.update_duck(fx);
@@ -731,6 +810,7 @@ mod tests {
     struct Fx {
         subscribed: bool,
         calls: Vec<Call>,
+        shows: Vec<Ui>,
         runs: u64,
         plays: u64,
     }
@@ -871,6 +951,9 @@ mod tests {
         fn set_announcing(&mut self, on: bool) {
             self.calls.push(Call::Announcing(on));
         }
+        fn show(&mut self, ui: Ui) {
+            self.shows.push(ui);
+        }
     }
 
     const URL: &str = "http://ha.local/tts/answer.flac";
@@ -912,6 +995,7 @@ mod tests {
                 fx: Fx {
                     subscribed: true,
                     calls: Vec::new(),
+                    shows: Vec::new(),
                     runs: 0,
                     plays: 0,
                 },
@@ -975,6 +1059,7 @@ mod tests {
 
         fn clear(&mut self) {
             self.fx.calls.clear();
+            self.fx.shows.clear();
         }
 
         fn listening(followup_s: u32) -> Self {
@@ -1168,7 +1253,10 @@ mod tests {
         r.fx.subscribed = false;
         assert!(!r.start("alice"));
         assert_eq!(r.phase(), Phase::Idle);
-        assert!(r.fx.calls.is_empty());
+        assert_eq!(
+            r.fx.calls,
+            [Call::Arm(Timer::ErrorShown, NOT_SUBSCRIBED_ERROR_MS)]
+        );
     }
 
     #[test]
@@ -1272,7 +1360,10 @@ mod tests {
         r.fx.subscribed = false;
         r.clear();
         assert!(!r.start("alice"));
-        assert!(r.fx.calls.is_empty());
+        assert_eq!(
+            r.fx.calls,
+            [Call::Arm(Timer::ErrorShown, NOT_SUBSCRIBED_ERROR_MS)]
+        );
         assert_eq!(r.phase(), Phase::Speaking);
     }
 
@@ -1839,7 +1930,10 @@ mod tests {
         r.fx.subscribed = false;
         r.button();
         assert_eq!(r.phase(), Phase::Idle);
-        assert!(r.fx.calls.is_empty());
+        assert_eq!(
+            r.fx.calls,
+            [Call::Arm(Timer::ErrorShown, NOT_SUBSCRIBED_ERROR_MS)]
+        );
     }
 
     #[test]
@@ -2574,6 +2668,13 @@ mod tests {
     }
 
     #[test]
+    fn stopping_the_ring_by_wake_word_clears_the_ring_state() {
+        let (mut r, _) = Rig::ringing();
+        assert!(!r.wake("Алиса"));
+        assert_eq!(r.fx.shows, [Ui::TimerRing, Ui::Idle]);
+    }
+
+    #[test]
     fn wake_stops_a_ring_that_started_during_the_dialog() {
         let mut r = Rig::loud();
         r.run_started();
@@ -2593,5 +2694,198 @@ mod tests {
         r.clear();
         assert!(!r.wake("Алиса"));
         assert!(r.fx.calls.is_empty());
+    }
+
+    #[test]
+    fn the_ring_follows_a_dialog() {
+        let (mut r, tts) = Rig::speaking(5, false);
+        assert_eq!(
+            r.fx.shows,
+            [Ui::Listening, Ui::Thinking, Ui::Speaking],
+            "no repeats while a phase lasts"
+        );
+        r.done(tts, true);
+        assert_eq!(r.fx.shows.last(), Some(&Ui::Idle));
+    }
+
+    #[test]
+    fn a_follow_up_turn_listens_again_and_ends_quietly() {
+        let mut r = Rig::followup_turn();
+        assert_eq!(r.fx.shows.last(), Some(&Ui::Listening));
+        r.clear();
+        r.ev(Va::Error, &[("code", "stt-no-text-recognized")]);
+        r.ev(Va::RunEnd, &[]);
+        assert_eq!(r.fx.shows, [Ui::Thinking, Ui::Idle]);
+    }
+
+    #[test]
+    fn a_pipeline_error_holds_the_ring_until_the_dialog_ends() {
+        let mut r = Rig::listening(5);
+        r.clear();
+        r.ev(Va::Error, &[("code", "stt-provider-unsupported")]);
+        r.ev(Va::RunEnd, &[]);
+        assert_eq!(r.fx.shows, [Ui::Error, Ui::Idle]);
+    }
+
+    #[test]
+    fn no_text_outside_a_follow_up_is_an_error_without_a_sound() {
+        let mut r = Rig::loud();
+        assert!(r.start(""));
+        r.ev(Va::RunStart, &[("url", URL)]);
+        r.clear();
+        r.ev(Va::Error, &[("code", "stt-no-text-recognized")]);
+        assert_eq!(r.fx.shows, [Ui::Error]);
+        assert!(r.fx.plays().is_empty());
+    }
+
+    #[test]
+    fn a_duplicate_wake_is_not_an_error() {
+        let mut r = Rig::listening(5);
+        r.clear();
+        r.ev(Va::Error, &[("code", "duplicate_wake_up_detected")]);
+        r.ev(Va::RunEnd, &[]);
+        assert_eq!(r.fx.shows, [Ui::Thinking, Ui::Idle]);
+    }
+
+    #[test]
+    fn a_start_without_ha_shows_an_error_but_not_with_the_mic_off() {
+        let mut r = Rig::new(5);
+        r.fx.subscribed = false;
+        assert!(!r.start(""));
+        assert_eq!(r.fx.shows, [Ui::Error]);
+        r.clear();
+        r.button();
+        assert_eq!(r.fx.shows, [Ui::Error]);
+
+        let mut r = Rig::new(5);
+        r.fx.subscribed = false;
+        r.d.set_mic_enabled(false, &mut r.fx);
+        assert!(!r.start(""));
+        assert!(r.fx.shows.is_empty());
+    }
+
+    #[test]
+    fn failed_runs_and_the_watchdog_show_an_error() {
+        let mut r = Rig::listening(5);
+        r.clear();
+        r.d.on_start_failed(r.fx.runs, &mut r.fx);
+        assert_eq!(r.fx.shows, [Ui::Error, Ui::Idle]);
+
+        let mut r = Rig::listening(5);
+        r.clear();
+        r.d.on_audio_overflow(r.fx.runs, &mut r.fx);
+        assert_eq!(r.fx.shows, [Ui::Error, Ui::Idle]);
+
+        let mut r = Rig::processing();
+        r.clear();
+        r.timer(Timer::Watchdog);
+        assert_eq!(r.fx.shows, [Ui::Error, Ui::Idle]);
+    }
+
+    #[test]
+    fn a_new_dialog_replaces_the_error() {
+        let mut r = Rig::new(5);
+        r.fx.subscribed = false;
+        r.start("");
+        r.fx.subscribed = true;
+        r.clear();
+        assert!(r.start(""));
+        assert_eq!(r.fx.shows, [Ui::Listening]);
+    }
+
+    #[test]
+    fn announcements_and_the_timer_ring_show_on_the_ring() {
+        let mut r = Rig::new(5);
+        r.d.on_announce(vec!["a".into()], false, &mut r.fx);
+        assert_eq!(r.fx.shows, [Ui::Speaking]);
+        let id = r.fx.last_play();
+        r.done(id, true);
+        assert_eq!(r.fx.shows, [Ui::Speaking, Ui::Idle]);
+
+        let (mut r, _) = Rig::ringing();
+        assert_eq!(r.fx.shows, [Ui::TimerRing]);
+        r.button();
+        assert_eq!(r.fx.shows, [Ui::TimerRing, Ui::Idle]);
+    }
+
+    #[test]
+    fn the_timer_ring_replaces_an_error() {
+        let mut r = Rig::loud();
+        r.fx.subscribed = false;
+        r.start("");
+        r.clear();
+        r.ha_timer(HaTimerEvent::Finished);
+        assert_eq!(r.fx.shows, [Ui::TimerRing]);
+    }
+
+    #[test]
+    fn the_real_state_returns_after_an_error_without_ha() {
+        let mut r = Rig::new(5);
+        r.d.on_media_announce("a".into(), &mut r.fx);
+        r.fx.subscribed = false;
+        r.clear();
+        assert!(!r.wake("Алиса"));
+        assert_eq!(r.fx.shows, [Ui::Error]);
+        assert_eq!(r.fx.armed(Timer::ErrorShown), Some(NOT_SUBSCRIBED_ERROR_MS));
+        r.timer(Timer::ErrorShown);
+        assert_eq!(r.fx.shows, [Ui::Error, Ui::Speaking]);
+    }
+
+    #[test]
+    fn ending_a_dialog_any_way_shows_idle() {
+        let mut r = Rig::listening(5);
+        r.clear();
+        r.d.set_mic_enabled(false, &mut r.fx);
+        assert_eq!(r.fx.shows, [Ui::Idle], "mic off while listening");
+
+        let mut r = Rig::listening(5);
+        r.clear();
+        r.d.on_link_lost(&mut r.fx);
+        assert_eq!(r.fx.shows, [Ui::Idle], "link lost");
+
+        let mut r = Rig::followup_turn();
+        r.clear();
+        r.timer(Timer::FollowupWait);
+        assert_eq!(r.fx.shows, [Ui::Idle], "nothing said in the follow-up");
+
+        let mut r = Rig::followup_turn();
+        r.clear();
+        r.d.set_followup_duration(0, &mut r.fx);
+        assert_eq!(r.fx.shows, [Ui::Idle], "follow-up turned off");
+    }
+
+    #[test]
+    fn the_ring_timeout_ends_the_ring_state() {
+        let (mut r, ring) = Rig::ringing();
+        r.clear();
+        r.timer(Timer::RingTimeout);
+        r.done(ring, true);
+        r.timer(Timer::RingTick);
+        assert_eq!(r.fx.shows, [Ui::Idle]);
+    }
+
+    #[test]
+    fn an_announcement_after_an_error_is_shown() {
+        let mut r = Rig::new(5);
+        r.fx.subscribed = false;
+        r.start("");
+        r.clear();
+        r.d.on_media_announce("a".into(), &mut r.fx);
+        assert_eq!(r.fx.shows, [Ui::Speaking]);
+    }
+
+    #[test]
+    fn an_error_is_remembered_as_shown() {
+        let mut r = Rig::listening(5);
+        r.ev(Va::Error, &[("code", "stt-provider-unsupported")]);
+        r.ev(Va::RunEnd, &[]);
+        r.clear();
+        assert!(r.start(""));
+        assert_eq!(r.fx.shows, [Ui::Listening]);
+        r.ev(Va::RunStart, &[("url", URL)]);
+        r.ev(Va::Error, &[("code", "stt-provider-unsupported")]);
+        r.clear();
+        r.d.on_link_lost(&mut r.fx);
+        assert_eq!(r.fx.shows, [Ui::Idle], "Error was shown, so Idle follows");
     }
 }

@@ -1,6 +1,6 @@
 use log::{debug, info, warn};
 use max_core::audio::{apply_gain, gain_from_db};
-use max_core::dialog::{Channel, Dialog, Effects, HaTimerEvent, PlayId, Sounds, Timer, Va};
+use max_core::dialog::{Channel, Dialog, Effects, HaTimerEvent, PlayId, Sounds, Timer, Ui, Va};
 use max_core::input::{InputAction, Keypad, Press};
 use max_core::media::{self, MediaAction, MediaCmd, MediaRequest, Shown};
 use max_core::mic::Mics;
@@ -17,6 +17,7 @@ use pulsar_lan::mdns::MdnsHandle;
 use crate::capture::AudioChunk;
 use crate::input::InputEvent;
 use crate::player::PlayerHandle;
+use crate::ring::RingHandle;
 use crate::wake::{WakeEvent, WakeHandle};
 use crate::{ESPHOME_SERVICE, VERSION, WAKE_PHRASE};
 
@@ -48,6 +49,7 @@ pub struct Controller {
     mdns: Option<MdnsHandle>,
     mic_gain_db: u32,
     command_offset_ms: i32,
+    voice_indication: bool,
     followup_s: u32,
     mics: Mics,
     keypad: Keypad,
@@ -58,6 +60,7 @@ pub struct Controller {
 pub struct Fx {
     api: ApiHandle,
     player: PlayerHandle,
+    ring: Option<RingHandle>,
     timers: Timers<Tick>,
     streaming: bool,
     ducked: bool,
@@ -74,12 +77,14 @@ impl Controller {
         mdns: Option<MdnsHandle>,
         sounds: Sounds,
         wake: Option<WakeHandle>,
+        ring: Option<RingHandle>,
     ) -> Self {
         Self {
             dialog: Dialog::new(DEFAULT_FOLLOWUP_S, sounds),
             fx: Fx {
                 api,
                 player,
+                ring,
                 timers: Timers::new(),
                 streaming: false,
                 ducked: false,
@@ -91,6 +96,7 @@ impl Controller {
             mdns,
             mic_gain_db: DEFAULT_MIC_GAIN_DB,
             command_offset_ms: 0,
+            voice_indication: true,
             followup_s: DEFAULT_FOLLOWUP_S,
             mics: Mics::default(),
             keypad: Keypad::new(),
@@ -114,6 +120,7 @@ impl Controller {
                 self.on_input_action(action);
             }
             InputEvent::MicMutedState(muted) => self.set_hw_muted(muted),
+            InputEvent::Knob => self.fx.foreign_draw(),
         }
     }
 
@@ -153,6 +160,9 @@ impl Controller {
     fn apply_mics(&mut self) {
         let on = !self.mics.muted();
         self.fx.api.publish_switch(SwitchId::Microphones, on);
+        if let Some(r) = &self.fx.ring {
+            r.set_muted(!on);
+        }
         self.dialog.set_mic_enabled(on, &mut self.fx);
         if let Some(w) = &self.wake {
             w.set_enabled(on);
@@ -166,7 +176,7 @@ impl Controller {
         api.publish_binary_sensor(BinarySensorId::HwMicMute, self.mics.hw_muted());
         api.publish_switch(SwitchId::AutoUpdate, false);
         api.publish_switch(SwitchId::NearestAnswers, false);
-        api.publish_switch(SwitchId::VoiceIndication, true);
+        api.publish_switch(SwitchId::VoiceIndication, self.voice_indication);
         api.publish_number(NumberId::MicGain, self.mic_gain_db as f32);
         api.publish_number(NumberId::FollowupDuration, self.followup_s as f32);
         api.publish_number(NumberId::CommandOffset, self.command_offset_ms as f32);
@@ -295,7 +305,10 @@ impl Controller {
                     self.fx.player.play(Channel::Music, vec![url]);
                 }
                 MediaAction::Announce(url) => self.dialog.on_media_announce(url, &mut self.fx),
-                MediaAction::SetVolume(v) => self.fx.player.set_volume(v),
+                MediaAction::SetVolume(v) => {
+                    self.fx.player.set_volume(v);
+                    self.fx.foreign_draw();
+                }
                 MediaAction::Resume => self.fx.player.resume(Channel::Music),
                 MediaAction::Pause => self.fx.player.pause(Channel::Music),
                 MediaAction::Stop => self.fx.player.stop(Channel::Music),
@@ -306,10 +319,19 @@ impl Controller {
     }
 
     fn on_switch(&mut self, id: SwitchId, on: bool) {
-        if id == SwitchId::Microphones {
-            self.mics.set_switch(on);
-            self.apply_mics();
-            return;
+        match id {
+            SwitchId::Microphones => {
+                self.mics.set_switch(on);
+                self.apply_mics();
+                return;
+            }
+            SwitchId::VoiceIndication => {
+                self.voice_indication = on;
+                if let Some(r) = &self.fx.ring {
+                    r.set_voice_indication(on);
+                }
+            }
+            _ => {}
         }
         self.fx.api.publish_switch(id, on);
     }
@@ -339,6 +361,13 @@ impl Controller {
 }
 
 impl Fx {
+    /// io.sdk shows the volume on the ring by itself.
+    fn foreign_draw(&self) {
+        if let Some(r) = &self.ring {
+            r.foreign_draw();
+        }
+    }
+
     fn publish_media(&self) {
         let st = match media::shown_state(self.announcing, self.music) {
             Shown::Idle => MediaState::Idle,
@@ -416,6 +445,12 @@ impl Effects for Fx {
     fn set_announcing(&mut self, on: bool) {
         self.announcing = on;
         self.publish_media();
+    }
+
+    fn show(&mut self, ui: Ui) {
+        if let Some(r) = &self.ring {
+            r.show(ui);
+        }
     }
 }
 

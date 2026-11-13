@@ -10,6 +10,7 @@ mod helper;
 mod input;
 mod player;
 mod replay;
+mod ring;
 #[allow(unsafe_code)]
 mod sys;
 #[allow(unsafe_code)]
@@ -207,7 +208,8 @@ async fn run(data_dir: &Path) -> u8 {
     };
     let (capture, mut audio) = capture::spawn(dex, wake_audio);
     let (_input, mut keys) = input::spawn();
-    let mut ctl = Controller::new(api, player, mdns, sounds, wake);
+    let ring = ring::spawn();
+    let mut ctl = Controller::new(api, player, mdns, sounds, wake, ring);
     ctl.publish_all();
     info!("pulsar-max {VERSION} running as {name}");
 
