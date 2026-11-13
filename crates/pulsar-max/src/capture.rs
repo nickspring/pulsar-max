@@ -13,17 +13,21 @@ use max_core::pcm::{Deinterleaver, S16Framer};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::helper::{self, Restarts};
+use crate::screen::ReferenceFeed;
 
 const CHANNEL_MASK: &str = "ffff";
 /// `vqe_0`, `vqe_bnr` and the first raw mic (docs/max.md, "Звук"): the spotter's omni, bnr and
 /// frequency filter inputs; HA hears `vqe_0`.
 pub const CHANNELS: [usize; 3] = [1, 2, 3];
 const CHANNEL_COUNT: usize = CHANNELS.len();
+/// The digital speaker reference L, R: everything that plays, for the screen spectrogram.
+const REFERENCE: [usize; 2] = [13, 14];
+const PIPE_CHANNELS: usize = CHANNEL_COUNT + REFERENCE.len();
 const INPUT_RATE: usize = 48_000;
 /// The HAL clicks up to 0 dBFS for about 0.5 s after every capture start.
 pub const SKIP_AFTER_START_FRAMES: usize = INPUT_RATE / 2;
-const SKIP_AFTER_START: usize = SKIP_AFTER_START_FRAMES * CHANNEL_COUNT;
-const READ_BYTES: usize = INPUT_RATE / 50 * 2 * CHANNEL_COUNT;
+const SKIP_AFTER_START: usize = SKIP_AFTER_START_FRAMES * PIPE_CHANNELS;
+const READ_BYTES: usize = INPUT_RATE / 50 * 2 * PIPE_CHANNELS;
 /// A restart jumps the stream position by a second, so consumers see the lost audio as a gap.
 const RESTART_GAP: u64 = 16_000;
 
@@ -74,6 +78,7 @@ impl Shared {
 pub fn spawn(
     dex: PathBuf,
     wake: Option<SyncSender<SpotterAudio>>,
+    screen: Option<ReferenceFeed>,
 ) -> (CaptureHandle, UnboundedReceiver<AudioChunk>) {
     let (tx, rx) = unbounded_channel();
     let shared = Arc::new(Shared {
@@ -83,7 +88,7 @@ pub fn spawn(
     let s = shared.clone();
     let thread = std::thread::Builder::new()
         .name("capture".into())
-        .spawn(move || supervise(&s, &dex, &tx, wake.as_ref()))
+        .spawn(move || supervise(&s, &dex, &tx, wake.as_ref(), screen.as_ref()))
         .map_err(|e| warn!("capture: thread: {e}"))
         .ok();
     (CaptureHandle { shared, thread }, rx)
@@ -94,12 +99,18 @@ fn supervise(
     dex: &Path,
     tx: &UnboundedSender<AudioChunk>,
     wake: Option<&SyncSender<SpotterAudio>>,
+    screen: Option<&ReferenceFeed>,
 ) {
     let mut restarts = Restarts::new();
     let mut pos = 0u64;
     while !shared.stop.load(Ordering::Relaxed) {
         restarts.attempt();
-        let channels = CHANNELS.map(|c| c.to_string()).join(",");
+        let channels = CHANNELS
+            .iter()
+            .chain(&REFERENCE)
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
         let spawned = helper::command(dex, &["capture", CHANNEL_MASK, &channels])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -110,7 +121,7 @@ fn supervise(
                     break;
                 };
                 info!("capture: helper started");
-                pump(out, &mut pos, tx, wake);
+                pump(out, &mut pos, tx, wake, screen);
                 pos += RESTART_GAP;
                 let status = shared
                     .child
@@ -135,13 +146,14 @@ fn pump(
     pos: &mut u64,
     tx: &UnboundedSender<AudioChunk>,
     wake: Option<&SyncSender<SpotterAudio>>,
+    screen: Option<&ReferenceFeed>,
 ) {
     let mut buf = vec![0u8; READ_BYTES];
     let mut framer = S16Framer::new(SKIP_AFTER_START);
-    let mut split = Deinterleaver::new(CHANNEL_COUNT);
+    let mut split = Deinterleaver::new(PIPE_CHANNELS);
     let mut decimators: [Decimator; CHANNEL_COUNT] = std::array::from_fn(|_| Decimator::new());
     let mut samples = Vec::with_capacity(READ_BYTES / 2 + 1);
-    let mut channels: [Vec<i16>; CHANNEL_COUNT] = Default::default();
+    let mut channels: [Vec<i16>; PIPE_CHANNELS] = Default::default();
     loop {
         let n = match out.read(&mut buf) {
             Ok(0) | Err(_) => return,
@@ -151,6 +163,12 @@ fn pump(
         framer.push(&buf[..n], &mut samples);
         channels.iter_mut().for_each(Vec::clear);
         split.push(&samples, &mut channels);
+        if let Some(feed) = screen
+            && feed.wanted()
+        {
+            let [l, r] = [&channels[CHANNEL_COUNT], &channels[CHANNEL_COUNT + 1]];
+            feed.send(l.iter().zip(r).flat_map(|(&a, &b)| [a, b]).collect());
+        }
         let [omni, bnr, raw] = std::array::from_fn(|c| {
             let mut out16 = Vec::with_capacity(channels[c].len() / 3 + 1);
             decimators[c].process(&channels[c], &mut out16);

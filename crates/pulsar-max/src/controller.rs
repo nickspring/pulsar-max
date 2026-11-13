@@ -9,6 +9,7 @@ use max_core::media::{self, MediaAction, MediaCmd, MediaRequest, Shown, VolumeSy
 use max_core::mic::Mics;
 use max_core::player_proto::{PlayState, PlayerEvent};
 use max_core::preroll::{self, Preroll};
+use max_core::screen::{ScreenChoice, ScreenCmd, Viz, playback_started, screen_source};
 use pulsar_core::Timers;
 use pulsar_esphome::{
     AnnounceRequest, ApiEvent, ApiHandle, BinarySensorId, EventId, MediaCommand,
@@ -22,19 +23,17 @@ use crate::capture::AudioChunk;
 use crate::input::InputEvent;
 use crate::player::PlayerHandle;
 use crate::ring::RingHandle;
+use crate::screen::ScreenHandle;
 use crate::wake::WakeHandle;
 use crate::{ESPHOME_SERVICE, VERSION, WAKE_PHRASE};
 
 /// Provisional: at 1-2 m `vqe_0` speech sits near -62 dBFS (docs/max.md, "Звук").
 const DEFAULT_MIC_GAIN_DB: u32 = 24;
 const DEFAULT_FOLLOWUP_S: u32 = 10;
-const MUSIC_VIZ_OPTION: &str = "Off";
 /// Two seconds of 16 kHz audio: longer than the wake thread's queue, so the pre-roll is complete.
 const PREROLL_SAMPLES: usize = 32_000;
 /// pulsar's pre-roll chunking.
 const PREROLL_CHUNK: usize = 512;
-
-pub const MUSIC_STYLES: &[&str] = &[MUSIC_VIZ_OPTION];
 
 pub enum Flow {
     Continue,
@@ -61,6 +60,8 @@ pub struct Controller {
     wake: Option<WakeHandle>,
     pairing_prompt: bool,
     ownership: MusicOwnership,
+    viz: Viz,
+    screen_choice: ScreenChoice,
 }
 
 pub struct Fx {
@@ -76,6 +77,7 @@ pub struct Fx {
     music: PlayState,
     sendspin: Option<SendspinHandle>,
     volume_click: Option<String>,
+    screen: Option<ScreenHandle>,
 }
 
 impl Controller {
@@ -103,6 +105,7 @@ impl Controller {
                 music: PlayState::Idle,
                 sendspin,
                 volume_click: sounds.volume,
+                screen: None,
             },
             mdns,
             mic_gain_db: DEFAULT_MIC_GAIN_DB,
@@ -115,6 +118,32 @@ impl Controller {
             wake,
             pairing_prompt: false,
             ownership: MusicOwnership::default(),
+            viz: Viz::Random,
+            screen_choice: ScreenChoice::default(),
+        }
+    }
+
+    pub fn set_screen(&mut self, screen: Option<ScreenHandle>) {
+        self.fx.screen = screen;
+    }
+
+    /// `restart`: a new playback began (io.sdk's spectrum start).
+    fn update_screen(&mut self, restart: bool) {
+        let Some(screen) = &self.fx.screen else {
+            return;
+        };
+        let source = screen_source(self.fx.music, self.fx.sendspin_streaming());
+        match self
+            .screen_choice
+            .update(self.viz, source, restart, random())
+        {
+            Some(ScreenCmd::Show {
+                style,
+                restart,
+                source,
+            }) => screen.show(style, restart, source),
+            Some(ScreenCmd::Hide) => screen.hide(),
+            None => {}
         }
     }
 
@@ -207,7 +236,7 @@ impl Controller {
         api.publish_number(NumberId::FollowupDuration, self.followup_s as f32);
         api.publish_number(NumberId::CommandOffset, self.command_offset_ms as f32);
         api.publish_number(NumberId::LedSpeed, 1.0);
-        api.publish_select(SelectId::MusicViz, MUSIC_VIZ_OPTION);
+        api.publish_select(SelectId::MusicViz, self.viz.label());
         api.publish_update(&UpdateState {
             in_progress: false,
             has_progress: false,
@@ -274,9 +303,11 @@ impl Controller {
         match ev {
             PlayerEvent::Done { id, ok } => self.dialog.on_play_done(id, ok, &mut self.fx),
             PlayerEvent::State(Channel::Music, st) => {
+                let started = playback_started(self.fx.music, st);
                 self.fx.music = st;
                 self.ownership.on_music_state(st, pulsar_core::now_ms());
                 self.fx.publish_media();
+                self.update_screen(started);
             }
             PlayerEvent::State(Channel::Announce, _) | PlayerEvent::Ready => {}
             PlayerEvent::Volume { index, max } => {
@@ -316,6 +347,15 @@ impl Controller {
             ApiEvent::MediaCommand(req) => self.on_media_command(req),
             ApiEvent::Switch(id, on) => self.on_switch(id, on),
             ApiEvent::Number(id, v) => self.on_number(id, v),
+            ApiEvent::Select(SelectId::MusicViz, v) => {
+                if let Some(viz) = Viz::parse(&v) {
+                    self.viz = viz;
+                    self.update_screen(false);
+                }
+                self.fx
+                    .api
+                    .publish_select(SelectId::MusicViz, self.viz.label());
+            }
             ApiEvent::Select(id, v) => self.fx.api.publish_select(id, &v),
             ApiEvent::MdnsTxtChanged(txt) => {
                 if let Some(m) = &self.mdns {
@@ -383,6 +423,7 @@ impl Controller {
                 if media::sendspin_stops_music(active, self.fx.music) {
                     self.fx.player.stop(Channel::Music);
                 }
+                self.update_screen(active);
             }
             SendspinEvent::Volume(v) => self.fx.set_volume(v),
             SendspinEvent::Mute(m) => self.fx.set_muted(m),
@@ -439,6 +480,9 @@ impl Fx {
     fn foreign_draw(&self) {
         if let Some(r) = &self.ring {
             r.foreign_draw();
+        }
+        if let Some(s) = &self.screen {
+            s.foreign_draw();
         }
     }
 
@@ -623,4 +667,11 @@ fn va(ev: VaEvent) -> Va {
             Va::Other
         }
     }
+}
+
+fn random() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_i64(pulsar_core::now_ms());
+    h.finish()
 }

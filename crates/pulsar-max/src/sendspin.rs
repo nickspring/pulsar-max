@@ -6,9 +6,13 @@ use max_core::music_out::{self, MusicOut};
 use pulsar_sendspin::{AudioOutput, Written};
 
 use crate::aaudio;
+use crate::screen::MusicTap;
 
-pub fn output() -> Arc<dyn AudioOutput> {
-    Arc::new(Output(MusicOut::new(AAudio)))
+pub fn output(tap: MusicTap) -> Arc<dyn AudioOutput> {
+    Arc::new(Output {
+        out: MusicOut::new(AAudio),
+        tap,
+    })
 }
 
 struct AAudio;
@@ -54,23 +58,32 @@ impl music_out::Stream for aaudio::Stream {
     }
 }
 
-struct Output(MusicOut<AAudio>);
+struct Output {
+    out: MusicOut<AAudio>,
+    tap: MusicTap,
+}
 
 impl AudioOutput for Output {
     fn configure(&self, rate: u32, channels: u8, bits: u8) {
-        self.0.configure(rate, channels, bits);
+        self.tap.configure(rate, channels, bits);
+        self.out.configure(rate, channels, bits);
     }
 
     fn release(&self) {
-        self.0.release();
+        self.out.release();
     }
 
     fn set_gain(&self, g: f32) {
-        self.0.set_gain(g);
+        self.out.set_gain(g);
     }
 
     fn write(&self, data: &[u8], timeout_ms: u32) -> Written {
-        let w = self.0.write(data, timeout_ms);
+        let format = self.tap.format();
+        let w = self.out.write(data, timeout_ms);
+        if let Some(format) = format {
+            self.tap
+                .send(format, &data[..w.bytes.min(data.len())], w.finish_in_us);
+        }
         Written {
             bytes: w.bytes,
             played: w.played,

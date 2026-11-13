@@ -18,3 +18,6 @@ pub mod pcm;
 pub mod player_proto;
 pub mod preroll;
 pub mod ring;
+pub mod screen;
+pub mod spectrogram;
+pub mod spectrum_sync;

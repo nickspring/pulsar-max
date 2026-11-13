@@ -13,6 +13,7 @@ mod input;
 mod player;
 mod replay;
 mod ring;
+mod screen;
 mod sendspin;
 #[allow(unsafe_code)]
 mod sys;
@@ -39,8 +40,9 @@ use pulsar_sendspin::SendspinConfig;
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use controller::{Controller, Flow, MUSIC_STYLES, Tick};
+use controller::{Controller, Flow, Tick};
 use max_core::dialog::Sounds;
+use max_core::screen::Viz;
 use max_wake::command::CommandSpotter;
 use max_wake::spotter::Spotter;
 use wake::SpotEvent;
@@ -150,6 +152,7 @@ fn device_identity() -> DeviceIdentity {
 async fn run(data_dir: &Path) -> u8 {
     let id = device_identity();
     let name = id.name.clone();
+    let (reference_feed, music_tap, screen_inputs) = screen::feeds();
     let ss_cfg = SendspinConfig {
         name: id.friendly_name.clone(),
         product_name: id.model.clone(),
@@ -157,7 +160,7 @@ async fn run(data_dir: &Path) -> u8 {
         software_version: id.project_version.clone(),
         mac: id.mac.to_ascii_lowercase(),
         state_dir: data_dir.join("sendspin"),
-        output: sendspin::output(),
+        output: sendspin::output(music_tap),
         port: SENDSPIN_PORT,
     };
     let ss_txt = vec![
@@ -180,7 +183,7 @@ async fn run(data_dir: &Path) -> u8 {
             })
             .collect(),
         active_wake_words: wake_ids.clone(),
-        music_styles: MUSIC_STYLES.iter().map(|s| (*s).to_owned()).collect(),
+        music_styles: Viz::all().map(|v| v.label().to_owned()).collect(),
         has_clock: false,
         has_lux: false,
         has_hw_mic_mute: true,
@@ -260,10 +263,13 @@ async fn run(data_dir: &Path) -> u8 {
             (None, None, rx, Some(tx))
         }
     };
-    let (capture, mut audio) = capture::spawn(dex, wake_audio);
+    let screen = screen::spawn(screen_inputs);
+    let screen_feed = screen.as_ref().map(|_| reference_feed);
+    let (capture, mut audio) = capture::spawn(dex, wake_audio, screen_feed);
     let (_input, mut keys) = input::spawn();
     let ring = ring::spawn();
     let mut ctl = Controller::new(api, player, mdns, sounds, wake, ring, sendspin);
+    ctl.set_screen(screen);
     for ev in early_player {
         ctl.on_player(ev);
     }

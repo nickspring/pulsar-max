@@ -28,7 +28,7 @@ pub struct RingHandle {
 }
 
 pub fn spawn() -> Option<RingHandle> {
-    let path = find_framebuffer()?;
+    let path = find_framebuffer(FB_NAME)?;
     let fb = match OpenOptions::new().write(true).open(&path) {
         Ok(f) => f,
         Err(e) => {
@@ -83,15 +83,15 @@ impl Drop for RingHandle {
     }
 }
 
-fn find_framebuffer() -> Option<PathBuf> {
+pub(crate) fn find_framebuffer(name: &str) -> Option<PathBuf> {
     let dir = std::fs::read_dir("/sys/class/graphics").ok()?;
-    let found = dir.filter_map(Result::ok).find(|e| {
-        std::fs::read_to_string(e.path().join("name")).is_ok_and(|n| n.trim() == FB_NAME)
-    });
+    let found = dir
+        .filter_map(Result::ok)
+        .find(|e| std::fs::read_to_string(e.path().join("name")).is_ok_and(|n| n.trim() == name));
     match found {
         Some(e) => Some(Path::new("/dev/graphics").join(e.file_name())),
         None => {
-            warn!("ring: no '{FB_NAME}' framebuffer");
+            warn!("no '{name}' framebuffer");
             None
         }
     }

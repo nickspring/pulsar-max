@@ -62,7 +62,7 @@ st "cat > $T/rec.raw" < rec.raw; st "$T/pulsar-max --spot $T/rec.raw"   # wake w
 st "cat > $T/probe.dex" < probes/java/build/classes.dex
 st "CLASSPATH=$T/probe.dex app_process /system/bin MaxProbe record 8 $T/out.raw ffff 1 0.05"
 st "cat $T/out.raw" > out.raw                    # binary only on this stream
-st 'cmd appops set com.yandex.io.sdk RECORD_AUDIO allow; kill $(pidof com.yandex.io.sdk)'
+st 'pm grant com.yandex.io.sdk android.permission.RECORD_AUDIO; cmd appops set com.yandex.io.sdk RECORD_AUDIO allow; kill $(pidof com.yandex.io.sdk)'
 st "rm -rf $T"
 ```
 
@@ -131,9 +131,15 @@ and restore it as above.
   `STREAM_MUSIC` itself. evgrab fails with EBUSY while the daemon holds the grab.
 - **Coexistence with the Yandex stack.** `com.yandex.io.sdk` cannot be disabled (protected
   package) or force-stopped (bound by system apps). The daemon takes the mic with
-  `cmd appops set com.yandex.io.sdk RECORD_AUDIO ignore` + `kill` of its process; Android 9 allows
-  only one capture at a time. io.sdk keeps drawing the clock into `fb4` and holds `fb5`, evdev
-  devices and `/dev/lp_uart`.
+  `cmd appops set com.yandex.io.sdk RECORD_AUDIO ignore` + `pm revoke ... RECORD_AUDIO` + `kill`
+  of its process (the revoke stops io.sdk's AudioRecord retry crash loop, docs/max.md); every path
+  that gives the mic back also runs `pm grant`. Android 9 allows only one capture at a time.
+  io.sdk keeps drawing the clock into `fb4` and holds `fb5`, evdev devices and `/dev/lp_uart`.
+- **Screen.** During music the daemon draws io.sdk's own spectrogram styles on `fb4`
+  (`max-core/src/spectrogram.rs`) from Sendspin frames at their playback time (Music Assistant) or
+  the speaker reference (capture channels 13-14, HA media), sharing the screen with io.sdk's clock
+  and animations by reading it back (`max-core/src/screen.rs`); io.sdk rewrites the clock every
+  second, so the daemon undoes that within ~1 ms (docs/architecture.md, "Экран").
 - **Identity.** ESPHome name `yandex-max-` + last 6 hex digits of the `wlan0` MAC (same scheme
   as pulsar); the platform is checked via `ro.yndx.quasar.platform`, since the devicetree has no
   `yandex,*` compatible.
@@ -148,7 +154,8 @@ and restore it as above.
 - Station safety: never touch the root method in `/odm` (`rootd`, `absshd`, `adbguard.sh`, its
   `/odm/etc/init/*.rc`) or `/data/local/tmp` files that are not ours; `/system` and `/vendor` are
   dm-verity. Our only file in `/odm` is `/odm/etc/init/pulsar-max.rc`, written and removed only by
-  `tools/install.sh`. Tests that take the mic from io.sdk must restore it (`RECORD_AUDIO allow` + `kill`),
+  `tools/install.sh`. Tests that take the mic from io.sdk must restore it
+  (`pm grant com.yandex.io.sdk android.permission.RECORD_AUDIO`, then `RECORD_AUDIO allow` + `kill`),
   and test files go to `/data/local/tmp/pulsar-max/` and are removed afterwards. Sound tests stay at
   volume <= 0.2 unless the owner allows more.
 - Live tests with the owner: one step at a time, every prompt in Russian, say exactly what to
