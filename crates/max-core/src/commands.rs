@@ -18,7 +18,7 @@ pub enum VoiceCommand {
     Prev,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum MusicAction {
     /// The HA channel if it plays or loads, and Sendspin if it streams: both may apply.
     Pause,
@@ -27,6 +27,11 @@ pub enum MusicAction {
     /// `step_alice`, unmuting; `click` goes to `want_volume_click` as `allowed`.
     Volume {
         up: bool,
+        click: bool,
+    },
+    /// An absolute 0..1 volume, as `Volume`; set without a click when the current one is unknown.
+    Level {
+        volume: f32,
         click: bool,
     },
     /// Sendspin only.
@@ -47,17 +52,63 @@ pub fn command_of(word: &str) -> Option<VoiceCommand> {
     })
 }
 
+fn word_break(c: char) -> bool {
+    c.is_whitespace()
+        || c.is_ascii_punctuation()
+        || matches!(c, '«' | '»' | '\u{2010}'..='\u{2027}' | '‹' | '›')
+}
+
 /// Whole phrase only, so "хватит ли времени" stays a request.
 pub fn stt_stop(text: &str) -> bool {
     let text = text.to_lowercase();
-    let sep = |c: char| {
-        c.is_whitespace()
-            || c.is_ascii_punctuation()
-            || matches!(c, '«' | '»' | '\u{2010}'..='\u{2027}' | '‹' | '›')
-    };
-    let mut words = text.split(sep).filter(|w| !w.is_empty()).peekable();
+    let mut words = text.split(word_break).filter(|w| !w.is_empty()).peekable();
     words.next_if(|w| matches!(*w, "алиса" | "яндекс"));
     words.peek().is_some() && words.all(|w| command_of(w) == Some(VoiceCommand::Stop))
+}
+
+/// "Алиса, громкость 5" as a whole phrase, on Alice's 0-10 scale (the station shows 1-10).
+pub fn stt_volume(text: &str) -> Option<f32> {
+    let text = text.to_lowercase();
+    let mut words = text
+        .split(|c| c != '%' && word_break(c))
+        .filter(|w| !w.is_empty())
+        .peekable();
+    words.next_if(|w| matches!(*w, "алиса" | "яндекс"));
+    words.next_if(|w| matches!(*w, "сделай" | "поставь" | "установи" | "включи"));
+    if words.next()? != "громкость" {
+        return None;
+    }
+    words.next_if(|w| *w == "на");
+    let word = words.next()?;
+    let n = digits_value(word).or_else(|| number_word(word))?;
+    if words.next().is_some() || n > ALICE_STEPS as u32 {
+        return None;
+    }
+    Some(n as f32 / ALICE_STEPS as f32)
+}
+
+fn digits_value(w: &str) -> Option<u32> {
+    if w.is_empty() || !w.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    w.parse().ok()
+}
+
+fn number_word(w: &str) -> Option<u32> {
+    Some(match w {
+        "ноль" => 0,
+        "один" | "одна" => 1,
+        "два" | "две" => 2,
+        "три" => 3,
+        "четыре" => 4,
+        "пять" => 5,
+        "шесть" => 6,
+        "семь" => 7,
+        "восемь" => 8,
+        "девять" => 9,
+        "десять" => 10,
+        _ => return None,
+    })
 }
 
 /// No arbitration for commands: every station that hears a word acts. Accepted compromise:
@@ -160,6 +211,17 @@ pub fn music_ops(action: MusicAction, s: &MusicState) -> Vec<MusicOp> {
                     click: want_volume_click((v, s.muted), (to, false), click),
                 });
             }
+        }
+        MusicAction::Level { volume, click } => {
+            if s.muted {
+                ops.push(MusicOp::Unmute);
+            }
+            ops.push(MusicOp::SetVolume {
+                volume,
+                click: s
+                    .volume
+                    .is_some_and(|v| want_volume_click((v, s.muted), (volume, false), click)),
+            });
         }
         MusicAction::Next => ops.push(MusicOp::Transport(TransportCmd::Next)),
         MusicAction::Prev => ops.push(MusicOp::Transport(TransportCmd::Previous)),
@@ -312,6 +374,90 @@ mod tests {
         );
         assert_eq!(step(None, true, true, true), [Unmute], "unknown volume");
         assert!(step(None, false, false, true).is_empty());
+    }
+
+    #[test]
+    fn an_absolute_level_unmutes_and_is_set_even_with_the_volume_unknown() {
+        use MusicOp::*;
+        let level = |volume, muted, to, click| {
+            let s = MusicState {
+                music: PlayState::Idle,
+                sendspin_streaming: false,
+                volume,
+                muted,
+            };
+            music_ops(MusicAction::Level { volume: to, click }, &s)
+        };
+        let set = |volume: f32, click| SetVolume { volume, click };
+        assert_eq!(level(Some(0.3), false, 0.5, true), [set(0.5, true)]);
+        assert_eq!(
+            level(Some(0.5), false, 0.5, true),
+            [set(0.5, false)],
+            "no change"
+        );
+        assert_eq!(
+            level(Some(0.5), true, 0.5, true),
+            [Unmute, set(0.5, true)],
+            "unmute"
+        );
+        assert_eq!(
+            level(Some(0.3), false, 0.05, false),
+            [set(0.05, false)],
+            "not allowed"
+        );
+        assert_eq!(
+            level(None, false, 0.7, true),
+            [set(0.7, false)],
+            "unknown volume"
+        );
+        assert_eq!(level(None, true, 0.0, true), [Unmute, set(0.0, false)]);
+    }
+
+    #[test]
+    fn stt_volume_phrases() {
+        for (text, volume) in [
+            ("громкость 5", 0.5),
+            ("Алиса, громкость 5.", 0.5),
+            ("«Громкость 5»", 0.5),
+            ("Яндекс — громкость на 3!", 0.3),
+            ("Алиса, громкость пять", 0.5),
+            ("громкость одна", 0.1),
+            ("громкость две", 0.2),
+            ("громкость десять", 1.0),
+            ("громкость ноль", 0.0),
+            ("громкость 0", 0.0),
+            ("громкость 10", 1.0),
+            ("Поставь громкость на 7", 0.7),
+            ("включи громкость 2", 0.2),
+        ] {
+            assert_eq!(stt_volume(text), Some(volume), "{text:?}");
+        }
+        for text in [
+            "",
+            "громкость",
+            "громкость на",
+            "громче",
+            "какая громкость сейчас",
+            "громкость пять и выключи свет",
+            "громкость 11",
+            "громкость тридцать",
+            "громкость 5%",
+            "громкость пять процентов",
+            "громкость 99999999999",
+            "громкость 2,5",
+            "громкость 0.5",
+            "громкость 5 5",
+            "громкость пять пять",
+            "громкость на на 5",
+            "громкость5",
+            "сделай громкость",
+            "сделай поставь громкость 5",
+            "Алиса, Алиса, громкость 5",
+            "громкость 5, Алиса",
+            "на громкость 5",
+        ] {
+            assert_eq!(stt_volume(text), None, "{text:?}");
+        }
     }
 
     #[test]

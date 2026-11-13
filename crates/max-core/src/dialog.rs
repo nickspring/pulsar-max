@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::commands::{
-    COMMAND_AFTER_WAKE_MS, MusicAction, VoiceCommand, command_allowed, stt_stop,
+    COMMAND_AFTER_WAKE_MS, MusicAction, VoiceCommand, command_allowed, stt_stop, stt_volume,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -367,7 +367,7 @@ impl Dialog {
                 }
             }
             Va::SttVadStart => fx.cancel(Timer::FollowupWait),
-            Va::SttEnd if self.in_run() && stt_stop(get("text")) => self.stt_stop_word(fx),
+            Va::SttEnd if self.in_run() => self.stt_text(get("text"), fx),
             Va::SttVadEnd | Va::SttEnd => self.stop_streaming(fx),
             Va::IntentStart => {
                 if self.phase == Phase::Listening {
@@ -633,6 +633,22 @@ impl Dialog {
         } else {
             // As stock: "стоп" with nothing else to stop pauses the music.
             fx.music(MusicAction::Pause);
+        }
+    }
+
+    /// The command spotter has no numbers, so "Алиса, громкость 5" comes only as text; with the
+    /// mic off it stays a request, as spotter commands are ignored then.
+    fn stt_text(&mut self, text: &str, fx: &mut impl Effects) {
+        if stt_stop(text) {
+            self.stt_stop_word(fx);
+        } else if let Some(volume) = stt_volume(text).filter(|_| self.mic_enabled) {
+            self.end_interaction(fx);
+            fx.music(MusicAction::Level {
+                volume,
+                click: self.volume_click_allowed(),
+            });
+        } else {
+            self.stop_streaming(fx);
         }
     }
 
@@ -922,7 +938,7 @@ impl Dialog {
 mod tests {
     use super::*;
 
-    #[derive(Clone, Debug, PartialEq, Eq)]
+    #[derive(Clone, Debug, PartialEq)]
     enum Call {
         StartRun(String),
         StopRun,
@@ -3466,5 +3482,119 @@ mod tests {
             assert_eq!(r.fx.stops(), 0);
             assert!(r.fx.music().is_empty());
         }
+    }
+
+    fn level(volume: f32, click: bool) -> MusicAction {
+        MusicAction::Level { volume, click }
+    }
+
+    impl Rig {
+        fn assert_volume_set_silently(&self, music: MusicAction) {
+            self.assert_ended();
+            assert_eq!(self.fx.stops(), 1);
+            assert!(self.fx.plays().is_empty(), "no cancel earcon");
+            assert_eq!(self.fx.music(), [music]);
+            let music = Call::Music(music);
+            assert!(self.fx.index(&Call::StopRun) < self.fx.index(&music));
+            assert!(self.fx.index(&Call::Duck(false)) < self.fx.index(&music));
+            assert_eq!(self.fx.shows.last(), Some(&Ui::Idle));
+        }
+    }
+
+    #[test]
+    fn stt_volume_after_the_wake_word_ends_the_run_silently_and_sets_the_level() {
+        for (window, processing) in [(true, false), (false, false), (false, true)] {
+            let mut r = Rig::woken();
+            if !window {
+                r.timer(Timer::CommandWindow);
+            }
+            if processing {
+                r.ev(Va::SttVadEnd, &[]);
+            }
+            r.clear();
+            r.stt("Алиса, громкость 5.");
+            r.assert_volume_set_silently(level(0.5, true));
+        }
+    }
+
+    #[test]
+    fn stt_volume_ends_any_dialog_silently() {
+        let mut r = Rig::loud();
+        r.button();
+        r.ev(Va::RunStart, &[("url", URL)]);
+        r.timer(Timer::CommandWindow);
+        r.clear();
+        r.stt("громкость 3");
+        r.assert_volume_set_silently(level(0.3, true));
+
+        let mut r = Rig::woken();
+        let tts = r.answer(true, true);
+        r.done(tts, true);
+        assert_eq!(r.phase(), Phase::Listening);
+        r.ev(Va::RunStart, &[("url", URL)]);
+        r.clear();
+        r.stt("Поставь громкость на 7");
+        r.assert_volume_set_silently(level(0.7, true));
+
+        let mut r = Rig::loud();
+        let ann = r.announce(true);
+        r.done(ann, true);
+        r.ev(Va::RunStart, &[("url", URL)]);
+        r.clear();
+        r.stt("громкость пять");
+        r.assert_volume_set_silently(level(0.5, true));
+    }
+
+    #[test]
+    fn stt_volume_leaves_a_ringing_timer_and_does_not_click_over_it() {
+        let mut r = Rig::woken();
+        r.ha_timer(HaTimerEvent::Finished);
+        r.clear();
+        r.stt("громкость два");
+        assert!(r.d.timer_ringing);
+        assert_eq!(r.phase(), Phase::Idle);
+        assert_eq!(r.fx.stops(), 1);
+        assert_eq!(r.fx.count(&Call::StopPlay(Channel::Announce)), 0);
+        assert!(r.fx.plays().is_empty());
+        assert_eq!(r.fx.music(), [level(0.2, false)]);
+        assert_eq!(r.fx.duck(), Some(true));
+        assert_eq!(r.d.ui(), Ui::TimerRing);
+    }
+
+    #[test]
+    fn stt_text_beyond_a_volume_phrase_stays_a_request() {
+        for (ev, text) in [
+            (Va::SttEnd, "какая громкость сейчас"),
+            (Va::SttEnd, "громкость пять и выключи свет"),
+            (Va::SttEnd, "громкость 150"),
+            (Va::SttEnd, "громкость"),
+            (Va::SttVadEnd, "громкость 5"),
+        ] {
+            let mut r = Rig::woken();
+            r.clear();
+            r.ev(ev, &[("text", text)]);
+            assert_eq!(r.phase(), Phase::Processing, "{text}");
+            assert_eq!(r.fx.stops(), 0, "{text}");
+            assert!(r.fx.music().is_empty(), "{text}");
+        }
+    }
+
+    #[test]
+    fn stt_volume_is_ignored_with_the_mic_off() {
+        let mut r = Rig::woken();
+        r.ev(Va::SttVadEnd, &[]);
+        r.d.set_mic_enabled(false, &mut r.fx);
+        r.clear();
+        r.stt("громкость 5");
+        assert_eq!(r.phase(), Phase::Processing, "stays an HA request");
+        assert_eq!(r.fx.stops(), 0);
+        assert!(r.fx.music().is_empty());
+
+        let mut r = Rig::woken();
+        r.d.set_mic_enabled(false, &mut r.fx);
+        assert_eq!(r.phase(), Phase::Idle);
+        r.clear();
+        r.stt("громкость 5");
+        assert!(r.fx.calls.is_empty(), "the run ended with the mic");
     }
 }
