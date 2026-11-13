@@ -138,8 +138,10 @@ and restore it as above.
 - **Screen.** During music the daemon draws io.sdk's own spectrogram styles on `fb4`
   (`max-core/src/spectrogram.rs`) from Sendspin frames at their playback time (Music Assistant) or
   the speaker reference (capture channels 13-14, HA media), sharing the screen with io.sdk's clock
-  and animations by reading it back (`max-core/src/screen.rs`); io.sdk rewrites the clock every
-  second, so the daemon undoes that within ~1 ms (docs/architecture.md, "Экран").
+  and animations through a `mmap` of `fb4` (`max-core/src/screen.rs`); io.sdk rewrites the clock
+  every second, so the daemon holds the fb lock with back-to-back pans while a rewrite is due and
+  puts its frame back before io.sdk's pan runs (docs/architecture.md, "Экран"). Never read() or
+  write() `fb4`: the driver pushes the current memory on both.
 - **Identity.** ESPHome name `yandex-max-` + last 6 hex digits of the `wlan0` MAC (same scheme
   as pulsar); the platform is checked via `ro.yndx.quasar.platform`, since the devicetree has no
   `yandex,*` compatible.

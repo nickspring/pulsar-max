@@ -1,6 +1,4 @@
-use std::fs::{File, OpenOptions};
-use std::os::unix::fs::FileExt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -12,13 +10,18 @@ use max_core::spectrogram::{Analyzer, Spectrogram, Spectrum, Style};
 use max_core::spectrum_sync::{MusicChunk, MusicSource, TapFormat};
 
 use crate::aaudio::monotonic_ns;
+use crate::sys::FbMap;
 
 const FB_NAME: &str = "YNDX LED screen";
+const SETTLE_NS: i64 = 200_000;
+/// Two holder pans: they push our frame while the guard goes on watching.
+const PUSH_NS: i64 = 3_500_000;
 /// ~0.6 s of the capture's 20 ms chunks.
 const QUEUE_CHUNKS: usize = 32;
 const SPEAKER_RATE: u32 = 48_000;
 const POLL: Duration = Duration::from_millis(100);
-const GUARD_POLL: Duration = Duration::from_millis(1);
+/// A clock hunt lasts seconds; between its slices the run loop serves the audio feeds.
+const GUARD_SLICE_NS: i64 = 10_000_000;
 
 #[derive(Debug)]
 enum Cmd {
@@ -114,17 +117,18 @@ pub fn feeds() -> (ReferenceFeed, MusicTap, Inputs) {
 
 pub fn spawn(inputs: Inputs) -> Option<ScreenHandle> {
     let path = crate::ring::find_framebuffer(FB_NAME)?;
-    let fb = match OpenOptions::new().read(true).write(true).open(&path) {
+    let fb = match FbMap::open(&path, FRAME_BYTES) {
         Ok(f) => f,
         Err(e) => {
             warn!("screen: {}: {e}", path.display());
             return None;
         }
     };
+    let holder = LockHolder::spawn(&path);
     let (tx, rx) = mpsc::channel();
     let thread = std::thread::Builder::new()
         .name("screen".into())
-        .spawn(move || run(&fb, &rx, &inputs))
+        .spawn(move || run(fb, holder, &rx, &inputs))
         .map_err(|e| warn!("screen: thread: {e}"))
         .ok()?;
     info!("screen: {}", path.display());
@@ -167,12 +171,81 @@ impl Drop for ScreenHandle {
     }
 }
 
+/// Pans back to back while io.sdk's clock is due, so its pan waits until our frame is back in memory.
+/// Two threads: the pan takes console_lock, a semaphore handed straight to a queued waiter.
+struct LockHolder {
+    until_ns: Arc<AtomicI64>,
+    stop: Arc<AtomicBool>,
+    threads: Vec<JoinHandle<()>>,
+}
+
+impl LockHolder {
+    fn spawn(path: &std::path::Path) -> Option<Self> {
+        let until_ns = Arc::new(AtomicI64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut threads = Vec::new();
+        for i in 0..2 {
+            let fb = FbMap::open(path, FRAME_BYTES)
+                .map_err(|e| warn!("screen: lock holder: {e}"))
+                .ok()?;
+            let (until, stopped) = (until_ns.clone(), stop.clone());
+            let t = std::thread::Builder::new()
+                .name(format!("screen-lock{i}"))
+                .spawn(move || {
+                    if let Err(e) = crate::sys::realtime_lowest() {
+                        warn!("screen: lock holder priority: {e}");
+                    }
+                    while !stopped.load(Ordering::Relaxed) {
+                        if monotonic_ns() < until.load(Ordering::Relaxed) {
+                            let _ = fb.pan();
+                        } else {
+                            std::thread::park_timeout(POLL);
+                        }
+                    }
+                })
+                .map_err(|e| warn!("screen: lock holder: {e}"))
+                .ok()?;
+            threads.push(t);
+        }
+        Some(Self {
+            until_ns,
+            stop,
+            threads,
+        })
+    }
+
+    fn hold_until(&self, ns: i64) {
+        self.until_ns.store(ns, Ordering::Relaxed);
+        for t in &self.threads {
+            t.thread().unpark();
+        }
+    }
+
+    fn release(&self) {
+        self.until_ns.store(0, Ordering::Relaxed);
+    }
+
+    fn holding(&self) -> bool {
+        monotonic_ns() < self.until_ns.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for LockHolder {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        for t in self.threads.drain(..) {
+            t.thread().unpark();
+            let _ = t.join();
+        }
+    }
+}
+
 fn now_ms(ns: i64) -> i64 {
     ns / 1_000_000
 }
 
 struct Screen<'a> {
-    fb: &'a File,
+    fb: FbMap,
     inputs: &'a Inputs,
     owner: ScreenOwner,
     /// Kept over a hide: a resume continues the picture.
@@ -182,24 +255,32 @@ struct Screen<'a> {
     music: MusicSource,
     spectra: Vec<(u64, Spectrum)>,
     error_logged: bool,
+    in_memory: Frame,
+    last_drawn: Frame,
+    holder: Option<LockHolder>,
     overflow_logged: bool,
 }
 
 impl Screen<'_> {
-    fn read(&self) -> Frame {
+    fn read(&mut self) -> Frame {
         let mut f = [0; FRAME_BYTES];
-        if let Err(e) = self.fb.read_exact_at(&mut f, 0) {
-            warn!("screen: read: {e}");
-        }
+        self.fb.snapshot(&mut f);
+        self.in_memory = f;
         f
     }
 
     fn write(&mut self, frame: &Frame) {
-        match self.fb.write_at(frame, 0) {
-            Ok(n) if n == frame.len() => self.error_logged = false,
-            result => {
+        self.in_memory = *frame;
+        // Our own pan would queue behind the holders and leave io.sdk's memmove unwatched; theirs push it.
+        if self.holder.as_ref().is_some_and(LockHolder::holding) {
+            self.fb.store(frame);
+            return;
+        }
+        match self.fb.show(frame) {
+            Ok(()) => self.error_logged = false,
+            Err(e) => {
                 if !self.error_logged {
-                    warn!("screen: write: {result:?}");
+                    warn!("screen: pan: {e}");
                     self.error_logged = true;
                 }
             }
@@ -246,6 +327,7 @@ impl Screen<'_> {
                 self.set_source(Some(source));
             }
             Cmd::Hide => {
+                self.release_lock();
                 self.set_source(None);
                 if let Some(clock) = self.owner.stop(now_ms(monotonic_ns())) {
                     self.write(&clock);
@@ -255,19 +337,66 @@ impl Screen<'_> {
         }
     }
 
-    /// io.sdk's clock rewrite is undone within a poll, not at our next frame 40 ms later.
-    fn guard_until(&mut self, end_ms: i64, tick_ns: Option<i64>) {
+    fn release_lock(&self) {
+        if let Some(h) = &self.holder {
+            h.release();
+        }
+    }
+
+    fn watching(&self, ms: i64) -> bool {
+        self.owner.watch(ms).is_some_and(|w| w.contains(&ms))
+    }
+
+    /// io.sdk's memmove may still be landing when we see its first bytes.
+    fn settle(&mut self, ours: &Frame) {
+        let end = monotonic_ns() + SETTLE_NS;
+        while monotonic_ns() < end {
+            if self.fb.differs(ours) {
+                let mut torn = [0; FRAME_BYTES];
+                self.fb.take_over(&mut torn, ours);
+            }
+            std::hint::spin_loop();
+        }
+    }
+
+    /// Spins: our frame back in memory before io.sdk's pan copies it means the clock never shows.
+    fn guard_until(&mut self, end_ns: i64, tick_ns: Option<i64>) {
+        if let Some(h) = &self.holder {
+            h.hold_until(end_ns);
+        }
         loop {
-            let current = self.read();
+            if self.fb.differs(&self.in_memory) {
+                let mut current = [0; FRAME_BYTES];
+                let took = self.in_memory == self.last_drawn;
+                if took {
+                    let ours = self.last_drawn;
+                    self.fb.take_over(&mut current, &ours);
+                } else {
+                    self.fb.snapshot(&mut current);
+                }
+                let ms = now_ms(monotonic_ns());
+                match self.owner.guard(ms, &current) {
+                    Some(f) => {
+                        self.settle(&f);
+                        if let Some(h) = &self.holder {
+                            h.hold_until(monotonic_ns() + PUSH_NS);
+                        }
+                        self.write(&f);
+                        return;
+                    }
+                    None if took => self.write(&current),
+                    None => self.in_memory = current,
+                }
+                if !self.watching(ms) {
+                    self.release_lock();
+                    return;
+                }
+            }
             let ns = monotonic_ns();
-            if let Some(f) = self.owner.guard(now_ms(ns), &current) {
-                self.write(&f);
+            if ns >= end_ns || tick_ns.is_some_and(|t| ns >= t) {
                 return;
             }
-            if now_ms(ns) >= end_ms || tick_ns.is_some_and(|t| ns >= t) {
-                return;
-            }
-            std::thread::sleep(GUARD_POLL);
+            std::hint::spin_loop();
         }
     }
 
@@ -279,6 +408,7 @@ impl Screen<'_> {
         let current = self.read();
         if let Some(f) = self.owner.frame(now_ms(monotonic_ns()), &current, &next) {
             self.write(&f);
+            self.last_drawn = f;
         }
     }
 
@@ -310,7 +440,11 @@ impl Screen<'_> {
     }
 }
 
-fn run(fb: &File, cmds: &Receiver<Cmd>, inputs: &Inputs) {
+fn run(fb: FbMap, holder: Option<LockHolder>, cmds: &Receiver<Cmd>, inputs: &Inputs) {
+    // A preempted guard lets the lock holder's next pan push io.sdk's clock itself.
+    if let Err(e) = crate::sys::realtime_lowest() {
+        warn!("screen: priority: {e}");
+    }
     let mut screen = Screen {
         fb,
         inputs,
@@ -321,6 +455,9 @@ fn run(fb: &File, cmds: &Receiver<Cmd>, inputs: &Inputs) {
         music: MusicSource::default(),
         spectra: Vec::new(),
         error_logged: false,
+        in_memory: [0; FRAME_BYTES],
+        last_drawn: [0; FRAME_BYTES],
+        holder,
         overflow_logged: false,
     };
     let mut audio_open = true;
@@ -344,7 +481,23 @@ fn run(fb: &File, cmds: &Receiver<Cmd>, inputs: &Inputs) {
         let ms = now_ms(ns);
         let watch = screen.owner.watch(ms);
         if let Some(w) = watch.as_ref().filter(|w| w.contains(&ms)) {
-            screen.guard_until(w.end, tick);
+            let end_ns = w.end * 1_000_000;
+            // Audio waits out a known window: a draw there could meet the tick unguarded.
+            if !screen.owner.hunting(ms) {
+                screen.guard_until(end_ns, tick);
+                continue;
+            }
+            if audio_open {
+                match inputs.rx.try_recv() {
+                    Ok(audio) => {
+                        screen.audio(audio);
+                        continue;
+                    }
+                    Err(TryRecvError::Empty) => {}
+                    Err(TryRecvError::Disconnected) => audio_open = false,
+                }
+            }
+            screen.guard_until(end_ns.min(ns + GUARD_SLICE_NS), tick);
             continue;
         }
         let until_watch = watch
