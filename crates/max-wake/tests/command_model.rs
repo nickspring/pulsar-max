@@ -1,7 +1,9 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use max_wake::command::CommandSpotter;
+use max_wake::fbank::MonoFbank;
+use max_wake::nnet::Nnet;
 
 const CHUNK: usize = 320;
 
@@ -48,4 +50,22 @@ fn command_model_on_a_recording() {
         elapsed.as_secs_f64(),
         elapsed.as_secs_f64() * 1000.0 / seconds
     );
+    if let Ok(out) = std::env::var("MAX_CMD_DUMP") {
+        dump(Path::new(&out), &pcm, &read("acoustic_model.nnet"));
+    }
+}
+
+fn dump(out: &Path, pcm: &[i16], nnet: &[u8]) {
+    let mut features = Vec::new();
+    MonoFbank::new().push(pcm, &mut features);
+    let mut posteriors = Vec::new();
+    Nnet::read(nnet)
+        .expect("model")
+        .forward(&features, &mut posteriors);
+    let write = |file: &str, values: &[f32]| {
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        std::fs::write(out.join(file), bytes).expect(file);
+    };
+    write("features.f32le", &features);
+    write("posteriors.f32le", &posteriors);
 }

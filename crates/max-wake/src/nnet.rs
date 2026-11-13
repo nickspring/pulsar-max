@@ -10,6 +10,7 @@ pub struct Nnet {
     heads: Vec<Affine>,
     x: Vec<f32>,
     y: Vec<f32>,
+    quantized: Quantized,
 }
 
 enum Layer {
@@ -20,12 +21,23 @@ enum Layer {
     HardSwish,
 }
 
+/// io.sdk's `dynamically-quantized-matmul`: the int16 weights stay as they are and every input
+/// frame is quantized to int16 with its own scale.
 struct Affine {
     rows: usize,
     cols: usize,
-    weights: Box<[f32]>,
+    // Rows padded with zeros to `padded(cols)`.
+    weights: Box<[i16]>,
     scale: f32,
     bias: Box<[f32]>,
+    input_range: i16,
+}
+
+/// Input frames of an `Affine`, padded with zeros like its rows.
+#[derive(Default)]
+struct Quantized {
+    values: Vec<i16>,
+    scales: Vec<f32>,
 }
 
 struct Conv {
@@ -92,7 +104,7 @@ impl Nnet {
                 }
                 Layer::HardSwish => self.x.iter_mut().for_each(|x| *x = hard_swish(*x)),
                 Layer::Affine(affine) => {
-                    affine.apply(&self.x, &mut self.y);
+                    affine.apply(&self.x, &mut self.quantized, &mut self.y);
                     std::mem::swap(&mut self.x, &mut self.y);
                     dim = affine.rows;
                 }
@@ -106,7 +118,7 @@ impl Nnet {
         out.resize(start + frames * self.output_dim, 0.0);
         let mut column = 0;
         for head in &self.heads {
-            head.apply(&self.x, &mut self.y);
+            head.apply(&self.x, &mut self.quantized, &mut self.y);
             let rows = out[start..].chunks_exact_mut(self.output_dim);
             for (row, z) in rows.zip(self.y.chunks_exact(head.rows)) {
                 let p = &mut row[column..column + head.rows];
@@ -127,15 +139,92 @@ impl Nnet {
     }
 }
 
+// Independent i32 lanes let LLVM keep them in vector registers (SMLAL on aarch64).
+const LANES: usize = 16;
+
+fn padded(cols: usize) -> usize {
+    cols.next_multiple_of(LANES)
+}
+
+/// Largest |quantized input| that keeps every lane of `dot` within i32: |lane| <= range * sum|w|
+/// of the lane, which for all-extreme weights is i32::MAX / (32768 * padded(cols) / LANES).
+fn input_range(weights: &[i16], cols: usize) -> i16 {
+    let worst_lane = weights
+        .chunks_exact(padded(cols))
+        .flat_map(|row| {
+            let mut lanes = [0i64; LANES];
+            for chunk in row.as_chunks::<LANES>().0 {
+                for (lane, &w) in lanes.iter_mut().zip(chunk) {
+                    *lane += i64::from(w).abs();
+                }
+            }
+            lanes
+        })
+        .max()
+        .unwrap_or(0);
+    let range = i64::from(i32::MAX) / worst_lane.max(1);
+    i16::try_from(range).unwrap_or(i16::MAX)
+}
+
+impl Quantized {
+    fn load(&mut self, x: &[f32], cols: usize, range: i16) {
+        let stride = padded(cols);
+        let range = f32::from(range);
+        self.values.clear();
+        self.values.resize(x.len() / cols * stride, 0);
+        self.scales.clear();
+        for (frame, q) in x
+            .chunks_exact(cols)
+            .zip(self.values.chunks_exact_mut(stride))
+        {
+            let max = frame.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let to_int = range / max;
+            // A frame this small is zero for the output, but scaling it would saturate every value.
+            if !to_int.is_finite() {
+                self.scales.push(0.0);
+                continue;
+            }
+            for (q, &v) in q.iter_mut().zip(frame) {
+                *q = (v * to_int).round().clamp(-range, range) as i16;
+            }
+            self.scales.push(max / range);
+        }
+    }
+}
+
 impl Affine {
-    fn apply(&self, x: &[f32], y: &mut Vec<f32>) {
-        let frames = x.len() / self.cols;
+    fn new(m: &Matrix, scale: f32, bias: Vec<f32>) -> Result<Self, String> {
+        let mut weights = vec![0; m.rows * padded(m.cols)];
+        for (padded, row) in weights
+            .chunks_exact_mut(padded(m.cols))
+            .zip(m.values.chunks_exact(m.cols))
+        {
+            padded[..m.cols].copy_from_slice(row);
+        }
+        let input_range = input_range(&weights, m.cols);
+        if input_range == 0 {
+            return Err(format!("{} columns overflow int32", m.cols));
+        }
+        Ok(Self {
+            rows: m.rows,
+            cols: m.cols,
+            weights: weights.into(),
+            scale,
+            bias: bias.into(),
+            input_range,
+        })
+    }
+
+    fn apply(&self, x: &[f32], q: &mut Quantized, y: &mut Vec<f32>) {
+        q.load(x, self.cols, self.input_range);
+        let stride = padded(self.cols);
         y.clear();
-        y.resize(frames * self.rows, 0.0);
-        let rows = self.weights.chunks_exact(self.cols).zip(self.bias.iter());
+        y.resize(q.scales.len() * self.rows, 0.0);
+        let rows = self.weights.chunks_exact(stride).zip(self.bias.iter());
         for (r, (w, &b)) in rows.enumerate() {
-            for (f, x) in x.chunks_exact(self.cols).enumerate() {
-                y[f * self.rows + r] = self.scale * dot(w, x) + b;
+            let frames = q.values.chunks_exact(stride).zip(&q.scales);
+            for (f, (x, &x_scale)) in frames.enumerate() {
+                y[f * self.rows + r] = self.scale * x_scale * dot(w, x) as f32 + b;
             }
         }
     }
@@ -167,22 +256,20 @@ impl Conv {
     }
 }
 
-fn dot(a: &[f32], b: &[f32]) -> f32 {
-    // Separate lanes: a single f32 accumulator would block vectorisation.
-    const LANES: usize = 16;
-    let (a_lanes, a_tail) = a.as_chunks::<LANES>();
-    let (b_lanes, b_tail) = b.as_chunks::<LANES>();
-    let mut acc = [0.0f32; LANES];
-    for (a, b) in a_lanes.iter().zip(b_lanes) {
-        for ((acc, &a), &b) in acc.iter_mut().zip(a).zip(b) {
-            *acc += a * b;
+/// Takes rows padded to whole lanes; `input_range` keeps every lane within i32.
+fn dot(w: &[i16], x: &[i16]) -> i64 {
+    let mut lanes = [0i32; LANES];
+    for (w, x) in w
+        .as_chunks::<LANES>()
+        .0
+        .iter()
+        .zip(x.as_chunks::<LANES>().0)
+    {
+        for ((lane, &w), &x) in lanes.iter_mut().zip(w).zip(x) {
+            *lane += i32::from(w) * i32::from(x);
         }
     }
-    let tail = a_tail
-        .iter()
-        .zip(b_tail)
-        .fold(0.0f32, |s, (&a, &b)| s + a * b);
-    acc.iter().sum::<f32>() + tail
+    lanes.iter().map(|&l| i64::from(l)).sum()
 }
 
 fn hard_swish(x: f32) -> f32 {
@@ -324,7 +411,7 @@ impl<'a> Reader<'a> {
             .as_chunks::<2>()
             .0
             .iter()
-            .map(|&b| f32::from(i16::from_le_bytes(b)))
+            .map(|&b| i16::from_le_bytes(b))
             .collect();
         Ok(Matrix { rows, cols, values })
     }
@@ -333,7 +420,7 @@ impl<'a> Reader<'a> {
 struct Matrix {
     rows: usize,
     cols: usize,
-    values: Vec<f32>,
+    values: Vec<i16>,
 }
 
 enum Value {
@@ -409,13 +496,7 @@ fn read_component<'a>(r: &mut Reader<'a>) -> Result<(&'a str, Component), String
         Kind::Scale => Component::Scale(fields.vector("<Scales>")?),
         Kind::Affine => {
             let (m, scale, bias) = fields.q16()?;
-            Component::Affine(Affine {
-                rows: m.rows,
-                cols: m.cols,
-                weights: m.values.into(),
-                scale,
-                bias: bias.into(),
-            })
+            Component::Affine(Affine::new(&m, scale, bias).map_err(|e| fields.error(e))?)
         }
         Kind::Conv => {
             let (m, scale, bias) = fields.q16()?;
@@ -428,7 +509,7 @@ fn read_component<'a>(r: &mut Reader<'a>) -> Result<(&'a str, Component), String
             let mut weights = vec![0.0; m.values.len()];
             for (ch, row) in m.values.chunks_exact(m.cols).enumerate() {
                 for (tap, &w) in row.iter().enumerate() {
-                    weights[tap * m.rows + ch] = w;
+                    weights[tap * m.rows + ch] = f32::from(w);
                 }
             }
             Component::Conv(Conv {
@@ -695,6 +776,7 @@ impl<'a> Graph<'a> {
             heads,
             x: Vec::new(),
             y: Vec::new(),
+            quantized: Quantized::default(),
         })
     }
 }
@@ -743,8 +825,8 @@ fn is_name(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixtures::f32le;
     use crate::fixtures::nnet3::{affine, component, conv, model, softmax_component};
+    use crate::fixtures::{f32le, lcg};
 
     const TINY: &[u8] = include_bytes!("../tests/fixtures/command_tiny.nnet");
     const OUTPUTS: usize = 8;
@@ -776,12 +858,105 @@ mod tests {
             .zip(&want)
             .map(|(g, w)| (g - w).abs())
             .fold(0.0f32, f32::max);
-        assert!(worst < 2e-6, "max abs difference {worst}");
+        // int16 inputs vs the float64 reference: 6.5e-5 measured; f32 inputs stayed below 2e-6.
+        assert!(worst < 1e-4, "max abs difference {worst}");
         for frame in got.as_chunks::<OUTPUTS>().0 {
             let (a, b) = frame.split_at(5);
             assert!((a.iter().sum::<f32>() - 1.0).abs() < 1e-6);
             assert!((b.iter().sum::<f32>() - 1.0).abs() < 1e-6);
         }
+    }
+
+    fn affine_of(rows: usize, values: Vec<i16>, scale: f32, bias: Vec<f32>) -> Affine {
+        let cols = values.len() / rows;
+        Affine::new(&Matrix { rows, cols, values }, scale, bias).unwrap()
+    }
+
+    #[test]
+    fn extreme_weights_and_inputs_do_not_overflow_a_lane() {
+        let (mut q, mut y) = (Quantized::default(), Vec::new());
+        for cols in [1, 16, 17, 40, 142, 197, 380, 435, 1000, 5000] {
+            let terms = (padded(cols) / LANES) as i64;
+            for w in [i16::MIN, i16::MAX] {
+                let a = affine_of(1, vec![w; cols], 1.0, vec![0.0]);
+                let range = i64::from(a.input_range);
+                let worst_lane = terms * i64::from(w).abs();
+                assert_eq!(range, (i64::from(i32::MAX) / worst_lane).min(32767));
+                for x in [-1i64, 1] {
+                    a.apply(&vec![x as f32; cols], &mut q, &mut y);
+                    assert!(q.values[..cols].iter().all(|&v| i64::from(v) == x * range));
+                    let exact = cols as i64 * i64::from(w) * x;
+                    assert_eq!(dot(&a.weights, &q.values), exact * range, "{cols} {w} {x}");
+                    let err = (f64::from(y[0]) - exact as f64).abs();
+                    assert!(err <= exact.abs() as f64 * 1e-6, "{cols} {w} {x}: {}", y[0]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_rows_too_long_for_any_input_range() {
+        let longest = LANES * 65535;
+        let a = affine_of(1, vec![i16::MIN; longest], 1.0, vec![0.0]);
+        assert_eq!(a.input_range, 1);
+        let m = Matrix {
+            rows: 1,
+            cols: longest + 1,
+            values: vec![i16::MIN; longest + 1],
+        };
+        let e = Affine::new(&m, 1.0, vec![0.0]).err().unwrap();
+        assert_eq!(e, format!("{} columns overflow int32", longest + 1));
+    }
+
+    #[test]
+    fn quantized_outputs_stay_within_half_a_step_of_exact() {
+        let (rows, cols, frames) = (8, 435, 6);
+        let weights: Vec<i16> = lcg(3, rows * cols).into_iter().map(|v| v as i16).collect();
+        let bias: Vec<f32> = (0..rows).map(|r| r as f32 - 4.0).collect();
+        let scale = 3e-4;
+        let a = affine_of(rows, weights.clone(), scale, bias.clone());
+        assert!(a.input_range < 32767);
+        // An outlier per frame sets its scale, so the other inputs get the coarsest steps.
+        let x: Vec<f32> = lcg(5, frames * cols)
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let outlier = i % cols == i / cols;
+                if outlier { 40.0 } else { v as f32 / 4096.0 }
+            })
+            .collect();
+        let (mut q, mut y) = (Quantized::default(), Vec::new());
+        a.apply(&x, &mut q, &mut y);
+        let scale = f64::from(scale);
+        for (f, frame) in x.chunks_exact(cols).enumerate() {
+            let max = frame.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let step = f64::from(max) / f64::from(a.input_range);
+            for (r, w) in weights.chunks_exact(cols).enumerate() {
+                let products = w
+                    .iter()
+                    .zip(frame)
+                    .map(|(&w, &x)| f64::from(w) * f64::from(x));
+                let exact = scale * products.sum::<f64>() + f64::from(bias[r]);
+                let l1: f64 = w.iter().map(|&w| f64::from(w).abs()).sum();
+                let bound = 0.5 * scale * step * l1 * 1.01 + 1e-6 * exact.abs();
+                let err = (f64::from(y[f * rows + r]) - exact).abs();
+                assert!(err <= bound, "frame {f} row {r}: {err} > {bound}");
+            }
+        }
+    }
+
+    #[test]
+    fn zero_and_subnormal_frames_give_the_bias() {
+        let a = affine_of(2, vec![1, -2, 3, 4, 5, -6], 0.5, vec![0.25, -1.0]);
+        let x = [0.0, 0.0, 0.0, 2.0, -4.0, 1.0, 1e-45, 0.0, -1e-45];
+        let (mut q, mut y) = (Quantized::default(), Vec::new());
+        a.apply(&x, &mut q, &mut y);
+        assert_eq!(y[..2], [0.25, -1.0]);
+        assert_eq!(y[4..], [0.25, -1.0]);
+        assert!(
+            (y[2] - 6.75).abs() < 1e-3 && (y[3] + 10.0).abs() < 1e-3,
+            "{y:?}"
+        );
     }
 
     #[test]

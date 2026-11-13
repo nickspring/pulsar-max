@@ -4,10 +4,13 @@ multi-phrase chen14 decoder. crates/max-wake/src/{nnet,chen14_multi,command}.rs 
 
 usage: cmd_ref.py <model_dir> <vqe.raw 16 kHz s16 mono>
        cmd_ref.py <model_dir> --capture <capture.raw 48 kHz s16 16ch> [--save16 <out.raw>]
+       cmd_ref.py <model_dir> --compare <dump_dir>
 
 <model_dir> is a local copy of the station's command spotter_model dir (acoustic_model.nnet,
 flags.txt, words.txt), never the repo. Prints hits as "phrase frame*10". --capture takes channel 1
-(vqe), decimates it to 16 kHz and drops the first 0.5 s.
+(vqe), decimates it to 16 kHz and drops the first 0.5 s. --compare runs this float64 net on the
+Rust features in <dump_dir> (MAX_CMD_DUMP=<dump_dir> of the command_model test) and prints the
+largest difference from the Rust posteriors there and the hits of both.
 """
 import pathlib
 import struct
@@ -312,9 +315,28 @@ def run(net, decoder_cfg, names, pcm):
     return hits
 
 
+def compare(net, decoder, names, dump):
+    feats = np.fromfile(dump / "features.f32le", "<f4").reshape(-1, len(BANKS))
+    got = np.fromfile(dump / "posteriors.f32le", "<f4").reshape(len(feats), -1)
+    want = net.forward(feats)
+    diff = np.abs(got - want)
+    frame, col = np.unravel_index(int(diff.argmax()), diff.shape)
+    print(f"{len(feats)} frames, max |rust - float64| {diff.max():.3g} at frame {frame} output {col}, "
+          f"mean {diff.mean():.3g}")
+    for label, post in (("float64", want), ("rust", got)):
+        ch = Chen14Multi(**decoder)
+        hits = [(names[h[0]], h[1] * 10) for h in map(ch.push, post.astype(F32)) if h]
+        print(label, len(hits), "hits:", " ".join(f"{n} {t}" for n, t in hits))
+
+
 def main():
     model = pathlib.Path(sys.argv[1])
     args = sys.argv[2:]
+    net = Net((model / "acoustic_model.nnet").read_bytes())
+    decoder, names = load_config((model / "flags.txt").read_text(), (model / "words.txt").read_text())
+    if args[0] == "--compare":
+        compare(net, decoder, names, pathlib.Path(args[1]))
+        return
     if args[0] == "--capture":
         raw = np.fromfile(args[1], "<i2").reshape(-1, 16)
         pcm = decimate3(raw[:, 1])[RATE // 2:]
@@ -322,8 +344,6 @@ def main():
             pcm.astype("<i2").tofile(args[args.index("--save16") + 1])
     else:
         pcm = np.fromfile(args[0], "<i2")
-    net = Net((model / "acoustic_model.nnet").read_bytes())
-    decoder, names = load_config((model / "flags.txt").read_text(), (model / "words.txt").read_text())
     for name, frame in run(net, decoder, names, pcm):
         print(name, frame * 10)
 

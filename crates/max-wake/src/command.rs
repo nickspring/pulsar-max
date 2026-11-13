@@ -59,10 +59,14 @@ impl CommandSpotter {
         &self.phrases
     }
 
+    /// Frames short of a whole `am-batch-size` batch wait for the next push, as in io.sdk: the
+    /// weights are read once per batch, not once per capture chunk.
     pub fn push(&mut self, vqe: &[i16]) -> Vec<CommandHit> {
         let mut hits = Vec::new();
         self.fbank.push(vqe, &mut self.features);
-        for batch in self.features.chunks(self.batch_frames * MEL_BINS) {
+        let batch_len = self.batch_frames * MEL_BINS;
+        let whole = self.features.len() / batch_len * batch_len;
+        for batch in self.features[..whole].chunks_exact(batch_len) {
             self.posteriors.clear();
             self.net.forward(batch, &mut self.posteriors);
             for frame in self.posteriors.chunks_exact(self.net.output_dim()) {
@@ -85,7 +89,7 @@ impl CommandSpotter {
                 });
             }
         }
-        self.features.clear();
+        self.features.drain(..whole);
         hits
     }
 
@@ -182,13 +186,28 @@ mod tests {
         let signal = command_signal();
         let whole = feed(&mut tiny(), &signal, signal.len());
         let mut s = tiny();
-        for chunk in [1, 160, 333, 4000] {
+        for chunk in [1, 160, 320, 333, 4000] {
             s.reset();
             assert_eq!(feed(&mut s, &signal, chunk), whole, "chunk {chunk}");
         }
         s.push(&signal[..12_345]);
         s.reset();
         assert_eq!(feed(&mut s, &signal, 320), whole);
+    }
+
+    #[test]
+    fn a_hit_waits_for_its_whole_batch() {
+        let signal = command_signal();
+        let (frame, command) = reference_hits()[0];
+        let batch = parse_command_config(FLAGS, WORDS).unwrap().batch_frames as u64;
+        assert_ne!((frame + 1) % batch, 0, "the hit frame must not end a batch");
+        let samples = |frames: u64| (frames - 1) as usize * FRAME_SHIFT + FRAME_LEN;
+        let mut s = tiny();
+        assert!(s.push(&signal[..samples(frame + 1)]).is_empty());
+        let batch_end = (frame / batch + 1) * batch;
+        let rest = &signal[samples(frame + 1)..samples(batch_end)];
+        let hits: Vec<(u64, usize)> = s.push(rest).iter().map(|h| (h.end, h.command)).collect();
+        assert_eq!(hits, [(end(frame), command)]);
     }
 
     // p("да") rises with the summed log-mel energy: loud frames hit, near-silent ones do not.

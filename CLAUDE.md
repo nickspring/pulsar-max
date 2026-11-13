@@ -113,7 +113,8 @@ and restore it as above.
   `vqe_0`/`vqe_bnr`/raw-mic chunks to the wake thread (`wake.rs`, bounded `try_send`); a hit
   carries the stream position, and the controller sends the `Preroll` after it, then live audio.
 - **Voice commands.** The same thread runs io.sdk's command spotter (`max-wake` `nnet.rs`,
-  `chen14_multi.rs`, `command.rs`: a Kaldi nnet3 Q16 model run in f32, multi-word chen14;
+  `chen14_multi.rs`, `command.rs`: a Kaldi nnet3 Q16 model run like io.sdk, int16 dynamically
+  quantized matmul in 6-frame batches with an overflow-free lane bound, f32 conv; multi-word chen14;
   docs/max.md, "Команды стока") on `vqe_0`, model read in place (`command` in `spotter.json`).
   pulsar's command rules are `max-core/src/commands.rs` and `Dialog::command`; `music_ops` turns
   a `MusicAction` (`Effects::music`) into player, Sendspin and volume operations that the controller
