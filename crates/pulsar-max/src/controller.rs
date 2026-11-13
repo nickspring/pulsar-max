@@ -5,7 +5,7 @@ use max_core::commands::{
 };
 use max_core::dialog::{Channel, Dialog, Effects, HaTimerEvent, PlayId, Sounds, Timer, Ui, Va};
 use max_core::input::{InputAction, Keypad, Press, knob_turn};
-use max_core::media::{self, MediaAction, MediaCmd, MediaRequest, Shown, VolumeSync};
+use max_core::media::{self, HaVolumeEcho, MediaAction, MediaCmd, MediaRequest, Shown, VolumeSync};
 use max_core::mic::Mics;
 use max_core::player_proto::{PlayState, PlayerEvent};
 use max_core::preroll::{self, Preroll};
@@ -74,6 +74,7 @@ pub struct Fx {
     announcing: bool,
     muted: bool,
     volume: VolumeSync,
+    ha_echo: HaVolumeEcho,
     music: PlayState,
     sendspin: Option<SendspinHandle>,
     volume_click: Option<String>,
@@ -102,6 +103,7 @@ impl Controller {
                 announcing: false,
                 muted: false,
                 volume: VolumeSync::default(),
+                ha_echo: HaVolumeEcho::default(),
                 music: PlayState::Idle,
                 sendspin,
                 volume_click: sounds.volume,
@@ -337,7 +339,16 @@ impl Controller {
             }
             ApiEvent::VoiceSubscribed(true) => {}
             ApiEvent::VoiceEvent { event, data } => {
-                self.dialog.on_va(va(event), &data, &mut self.fx);
+                let ev = va(event);
+                if ev == Va::SttEnd {
+                    info!(
+                        "voice: stt '{}'",
+                        data.get("text").map_or("", String::as_str)
+                    );
+                } else if ev == Va::Error {
+                    info!("voice: error {:?}", data.get("code"));
+                }
+                self.dialog.on_va(ev, &data, &mut self.fx);
             }
             ApiEvent::VoiceStartFailed { run } => self.dialog.on_start_failed(run, &mut self.fx),
             ApiEvent::VoiceAudioOverflow { run } => {
@@ -387,9 +398,16 @@ impl Controller {
     }
 
     fn on_media_command(&mut self, req: MediaCommandRequest) {
+        let volume = req.volume.filter(|&v| {
+            let echo = self.fx.ha_echo.swallow(v, pulsar_core::now_ms());
+            if echo {
+                info!("media: HA volume {v} after a spoken level ignored");
+            }
+            !echo
+        });
         let req = MediaRequest {
             command: req.command.map(media_cmd),
-            volume: req.volume,
+            volume,
             url: req.media_url,
             announcement: req.announcement == Some(true),
         };
@@ -550,6 +568,9 @@ impl Effects for Fx {
         };
         if state.volume.is_none() && matches!(action, MusicAction::Volume { .. }) {
             warn!("volume step: STREAM_MUSIC volume unknown");
+        }
+        if let MusicAction::Level { volume, .. } = action {
+            self.ha_echo.expect(volume, pulsar_core::now_ms());
         }
         for op in music_ops(action, &state) {
             match op {

@@ -102,6 +102,26 @@ impl VolumeSync {
     }
 }
 
+const HA_ECHO_MS: i64 = 10_000;
+
+/// HA still runs its intent on "громкость 5" after the stop and sends volume_set 0.05.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HaVolumeEcho {
+    expected: Option<(i32, i64)>,
+}
+
+impl HaVolumeEcho {
+    pub fn expect(&mut self, spoken_level: f32, now_ms: i64) {
+        self.expected = Some((percent(spoken_level / 10.0), now_ms + HA_ECHO_MS));
+    }
+
+    pub fn swallow(&mut self, volume: f32, now_ms: i64) -> bool {
+        self.expected
+            .take()
+            .is_some_and(|(p, until)| now_ms < until && percent(volume) == p)
+    }
+}
+
 fn percent(v: f32) -> i32 {
     (v * 100.0).round() as i32
 }
@@ -270,6 +290,32 @@ fn wav_s16_mono(rate: u32, samples: &[i16]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ha_echo_of_a_spoken_level_is_swallowed_once() {
+        let mut e = HaVolumeEcho::default();
+        e.expect(0.5, 1_000);
+        assert!(e.swallow(0.05, 1_040));
+        assert!(!e.swallow(0.05, 1_080), "only one echo");
+
+        e.expect(1.0, 0);
+        assert!(e.swallow(0.1, 9_999));
+        e.expect(0.0, 0);
+        assert!(e.swallow(0.0, 0));
+    }
+
+    #[test]
+    fn ha_volume_that_is_not_the_echo_passes_and_ends_the_wait() {
+        let mut e = HaVolumeEcho::default();
+        assert!(!e.swallow(0.05, 0), "nothing spoken");
+
+        e.expect(0.5, 0);
+        assert!(!e.swallow(0.5, 100), "a slider move in HA");
+        assert!(!e.swallow(0.05, 200));
+
+        e.expect(0.5, 0);
+        assert!(!e.swallow(0.05, HA_ECHO_MS), "too late");
+    }
 
     fn req(command: Option<MediaCmd>) -> MediaRequest {
         MediaRequest {
