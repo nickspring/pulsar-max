@@ -32,8 +32,8 @@ pub enum InputEvent {
         at_ms: i64,
     },
     MicMutedState(bool),
-    /// The volume knob turned; io.sdk keeps handling it and draws the volume on the ring.
-    Knob,
+    /// The volume knob; io.sdk keeps handling it and draws the volume on the ring.
+    Knob(RawEvent),
 }
 
 pub struct InputHandle {
@@ -75,7 +75,8 @@ fn run_knob(stop: &AtomicBool, tx: &UnboundedSender<InputEvent>) {
                     if file.read_exact(&mut buf).is_err() {
                         break;
                     }
-                    if decode(&buf).kind == EV_KEY && tx.send(InputEvent::Knob).is_err() {
+                    let ev = decode(&buf);
+                    if ev.kind == EV_KEY && tx.send(InputEvent::Knob(ev)).is_err() {
                         return;
                     }
                 }

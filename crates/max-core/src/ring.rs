@@ -13,7 +13,8 @@ pub const FILES: [(Role, &str); 6] = [
 // Timings of io.sdk's ring: docs/max.md, "Светодиоды и экран".
 pub const ERROR_MS: u64 = 3_000;
 pub const MUTE_MS: u64 = 960;
-pub const VOLUME_MS: u64 = 1_000;
+/// io.sdk's 1000 ms overlay starts after its key handling and debounce.
+pub const VOLUME_MS: u64 = 1_200;
 /// io.sdk draws over us without notice (its alarms, the volume set from HA): a lit frame is
 /// written again this often.
 pub const REASSERT_MS: u64 = 200;
@@ -295,6 +296,11 @@ pub struct Output {
 }
 
 impl Output {
+    /// The last write failed: the next step writes the frame again.
+    pub fn forget(&mut self) {
+        self.written = None;
+    }
+
     pub fn step(&mut self, ring: &mut Ring, now: u64) -> Step {
         let write = match ring.frame(now) {
             Some(frame) => {
@@ -611,15 +617,16 @@ mod tests {
         r.set_muted(true, 0);
         r.show(Ui::Listening, 100);
         r.foreign_draw(900);
-        assert_eq!(run_to(&mut r, 100, 1_900), Some(bytes(LISTEN_A)));
-        assert_eq!(run_to(&mut r, 1_900, 2_000), Some(bytes(LISTEN_B)));
+        let shown = 900 + VOLUME_MS;
+        assert_eq!(run_to(&mut r, 100, shown), Some(bytes(LISTEN_A)));
+        assert_eq!(run_to(&mut r, shown, shown + 100), Some(bytes(LISTEN_B)));
 
         let mut r = ring();
         r.set_muted(false, 0);
         r.set_muted(true, 0);
         r.foreign_draw(500);
         r.show(Ui::Listening, 600);
-        assert_eq!(run_to(&mut r, 600, 1_500), Some(bytes(LISTEN_A)));
+        assert_eq!(run_to(&mut r, 600, 500 + VOLUME_MS), Some(bytes(LISTEN_A)));
     }
 
     #[test]
@@ -685,6 +692,16 @@ mod tests {
                 wake: Some(100)
             }
         );
+    }
+
+    #[test]
+    fn output_retries_a_frame_whose_write_failed() {
+        let mut r = ring();
+        let mut out = Output::default();
+        assert_eq!(out.step(&mut r, 0).write, Some(BLACK_FRAME));
+        out.forget();
+        assert_eq!(out.step(&mut r, 10).write, Some(BLACK_FRAME));
+        assert_eq!(out.step(&mut r, 20).write, None);
     }
 
     #[test]

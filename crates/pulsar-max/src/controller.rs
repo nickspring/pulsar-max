@@ -1,7 +1,7 @@
 use log::{debug, info, warn};
 use max_core::audio::{apply_gain, gain_from_db};
 use max_core::dialog::{Channel, Dialog, Effects, HaTimerEvent, PlayId, Sounds, Timer, Ui, Va};
-use max_core::input::{InputAction, Keypad, Press};
+use max_core::input::{InputAction, Keypad, Press, knob_turn};
 use max_core::media::{self, MediaAction, MediaCmd, MediaRequest, Shown};
 use max_core::mic::Mics;
 use max_core::player_proto::{PlayState, PlayerEvent};
@@ -120,7 +120,13 @@ impl Controller {
                 self.on_input_action(action);
             }
             InputEvent::MicMutedState(muted) => self.set_hw_muted(muted),
-            InputEvent::Knob => self.fx.foreign_draw(),
+            InputEvent::Knob(ev) => {
+                self.fx.foreign_draw();
+                if let Some(up) = knob_turn(ev) {
+                    let event = if up { "volume_up" } else { "volume_down" };
+                    self.fx.api.fire_event(EventId::Button, event);
+                }
+            }
         }
     }
 

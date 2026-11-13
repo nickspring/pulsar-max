@@ -136,6 +136,21 @@ impl Keypad {
     }
 }
 
+const KNOB_UP: u16 = 104;
+const KNOB_DOWN: u16 = 109;
+
+/// A knob click from `rotary-volume`: `Some(true)` louder, `Some(false)` quieter (docs/max.md).
+pub fn knob_turn(ev: RawEvent) -> Option<bool> {
+    if ev.kind != EV_KEY || ev.value != 1 {
+        return None;
+    }
+    match ev.code {
+        KNOB_UP => Some(true),
+        KNOB_DOWN => Some(false),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -388,5 +403,14 @@ mod tests {
         assert_eq!(k.on_event(syn(SYN_DROPPED), 0), None);
         k.reset();
         assert_eq!(k.on_event(mute(1), 0), Some(InputAction::MicMuted(true)));
+    }
+
+    #[test]
+    fn knob_clicks_are_read_on_the_press() {
+        assert_eq!(knob_turn(ev(EV_KEY, KEY_PAGEUP, 1)), Some(true));
+        assert_eq!(knob_turn(ev(EV_KEY, 109, 1)), Some(false));
+        assert_eq!(knob_turn(ev(EV_KEY, KEY_PAGEUP, 0)), None);
+        assert_eq!(knob_turn(ev(EV_KEY, KEY_VOICECOMMAND, 1)), None);
+        assert_eq!(knob_turn(ev(EV_MSC, KEY_PAGEUP, 1)), None);
     }
 }

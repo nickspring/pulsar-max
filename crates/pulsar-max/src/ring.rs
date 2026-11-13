@@ -121,12 +121,14 @@ fn run(mut ring: Ring, fb: &File, rx: &Receiver<Cmd>) {
         let step = output.step(&mut ring, now());
         if let Some(frame) = step.write {
             match fb.write_at(&frame, 0) {
-                Ok(_) => error_logged = false,
-                Err(e) if !error_logged => {
-                    warn!("ring: write: {e}");
-                    error_logged = true;
+                Ok(n) if n == frame.len() => error_logged = false,
+                result => {
+                    output.forget();
+                    if !error_logged {
+                        warn!("ring: write: {result:?}");
+                        error_logged = true;
+                    }
                 }
-                Err(_) => {}
             }
         }
         let wait = step.wake.map_or(IDLE_WAIT, |w| {
