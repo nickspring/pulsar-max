@@ -10,7 +10,8 @@ STOP_WAIT=10
 
 is_supervisor() {
   if [ -r "/proc/$1/cmdline" ]; then
-    tr '\0' ' ' < "/proc/$1/cmdline" | grep -q supervise.sh
+    # toybox tr spins on the read error of a process exiting under it; grep just fails.
+    grep -qs supervise.sh "/proc/$1/cmdline"
   else
     ps -p "$1" -o args= 2>/dev/null | grep -q supervise.sh
   fi
