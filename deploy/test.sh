@@ -56,6 +56,14 @@ setup() {
   : > "$FAKE/runs"
   : > "$FAKE/signals"
   echo "RECORD_AUDIO: ignore" > "$FAKE/appops"
+  echo revoked > "$FAKE/perm"
+  stub pm 'case "$1 $3" in
+  "grant android.permission.RECORD_AUDIO") echo granted > "$FAKE/perm" ;;
+  "revoke android.permission.RECORD_AUDIO") echo revoked > "$FAKE/perm" ;;
+esac'
+  stub dumpsys '[ "$1 $2" = "package com.yandex.io.sdk" ] || exit 0
+[ "$(cat "$FAKE/perm")" = granted ] && v=true || v=false
+echo "      android.permission.RECORD_AUDIO: granted=$v, flags=[ GRANTED_BY_DEFAULT ]"'
   ( /bin/sleep 300 & echo $! > "$T/iosdk.pid" )
   stub cmd 'case "$*" in
   "appops get"*) cat "$FAKE/appops" ;;
@@ -95,13 +103,28 @@ wait_for() { # $1: shell condition, up to 5 s
 setup
 check "disabled: exit" "$(supervise)" 0
 check "disabled: mic back" "$(cat "$FAKE/appops")" "RECORD_AUDIO: allow"
+check "disabled: permission back" "$(cat "$FAKE/perm")" granted
 check "disabled: io.sdk restarted" "$(iosdk_alive)" no
 check "disabled: no run" "$(runs)" ""
 
 setup
 echo "RECORD_AUDIO: allow" > "$FAKE/appops"
+echo granted > "$FAKE/perm"
 check "disabled, mic already back: exit" "$(supervise)" 0
 check "disabled, mic already back: io.sdk untouched" "$(iosdk_alive)" yes
+
+setup
+echo "RECORD_AUDIO: allow" > "$FAKE/appops"
+check "disabled, only the permission revoked: exit" "$(supervise)" 0
+check "disabled, only the permission revoked: permission back" "$(cat "$FAKE/perm")" granted
+check "disabled, only the permission revoked: io.sdk restarted" "$(iosdk_alive)" no
+
+setup
+echo "RECORD_AUDIO: allow" > "$FAKE/appops"
+echo granted > "$FAKE/perm"
+stub dumpsys 'exit 1'
+check "disabled, permission state unreadable: exit" "$(supervise)" 0
+check "disabled, permission state unreadable: io.sdk restarted" "$(iosdk_alive)" no
 
 setup
 fake_daemon "$T/d/bin" new
@@ -122,6 +145,7 @@ check "no prev: gives up" "$(supervise)" 1
 check "no prev: runs" "$(runs)" "new new new new new"
 check "no prev: disabled" "$(exists "$T/d/enabled")" no
 check "no prev: mic back" "$(cat "$FAKE/appops")" "RECORD_AUDIO: allow"
+check "no prev: permission back" "$(cat "$FAKE/perm")" granted
 check "no prev: io.sdk restarted" "$(iosdk_alive)" no
 check "no prev: logged" "$(grep -c 'no previous version' "$T/d/pulsar-max.log")" 1
 check "no prev: pid file gone" "$(exists "$T/d/supervise.pid")" no
@@ -225,6 +249,7 @@ check "a second supervisor leaves" "$(supervise)" 0
 check "a second supervisor keeps the pid file" "$(cat "$T/d/supervise.pid")" "$first"
 check "a second supervisor runs nothing" "$(runs)" new
 check "a second supervisor keeps the mic" "$(cat "$FAKE/appops")" "RECORD_AUDIO: ignore"
+check "a second supervisor keeps the permission" "$(cat "$FAKE/perm")" revoked
 kill -TERM "$first"
 kill -TERM "$(cat "$FAKE/daemon.pid")"
 wait_for '[ ! -f "$T/d/supervise.pid" ]'
@@ -254,6 +279,7 @@ check "disable: flag gone" "$(exists "$T/d/enabled")" no
 check "disable: supervisor gone" "$(exists "$T/d/supervise.pid")" no
 check "disable: daemon stopped" "$(pidof pulsar-max || echo none)" none
 check "disable: mic back" "$(cat "$FAKE/appops")" "RECORD_AUDIO: allow"
+check "disable: permission back" "$(cat "$FAKE/perm")" granted
 check "disable: io.sdk restarted" "$(iosdk_alive)" no
 
 setup
@@ -293,6 +319,7 @@ fake_daemon "$T/d/prev" old
 ctl rollback
 check "rollback while disabled: stays off" "$(exists "$T/d/enabled") $(runs)" "no "
 check "rollback while disabled: mic back" "$(cat "$FAKE/appops")" "RECORD_AUDIO: allow"
+check "rollback while disabled: permission back" "$(cat "$FAKE/perm")" granted
 check "usage" "$(ctl bogus > /dev/null; echo $?)" 2
 
 setup
@@ -341,7 +368,7 @@ check "rc: no \$ for init to expand" "$(grep -v '^#' "$HERE/pulsar-max.rc" | gre
 check "rc: runs the supervisor only when readable" \
   "$(echo "$rc_service" | grep -c '\[ -r /data/pulsar-max/supervise.sh \] && exec')" 1
 check "rc: gives the mic back and restarts io.sdk" \
-  "$(echo "$rc_service" | grep -c 'RECORD_AUDIO allow; am crash com.yandex.io.sdk"$')" 1
+  "$(echo "$rc_service" | grep -c 'pm grant com.yandex.io.sdk android.permission.RECORD_AUDIO; cmd appops set com.yandex.io.sdk RECORD_AUDIO allow; am crash com.yandex.io.sdk"$')" 1
 
 echo "$passed passed, $failed failed"
 [ $failed = 0 ]

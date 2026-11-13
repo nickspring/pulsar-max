@@ -50,6 +50,7 @@ stop_all() {
 
 # Unconditional: io.sdk started under a denial stays deaf after `allow` until it restarts.
 give_back_mic() {
+  pm grant $IOSDK android.permission.RECORD_AUDIO
   cmd appops set $IOSDK RECORD_AUDIO allow
   for pid in $(pidof $IOSDK); do kill -9 "$pid"; done
 }

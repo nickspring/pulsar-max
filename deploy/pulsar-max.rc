@@ -2,7 +2,7 @@
 # SELinux is enforcing at boot_completed until rootd switches it to permissive (docs/max.md,
 # "Платформа"); without permissive in 5 min io.sdk gets the microphone back (am crash: a restart
 # through system_server, not a kill from our domain). No "$": init expands it.
-service pulsar-max /system/bin/sh -c "for a in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do for b in 1 2 3 4 5 6 7 8 9 10; do getenforce | grep -q Permissive && [ -r /data/pulsar-max/supervise.sh ] && exec /system/bin/sh /data/pulsar-max/supervise.sh; sleep 2; done; done; cmd appops set com.yandex.io.sdk RECORD_AUDIO allow; am crash com.yandex.io.sdk"
+service pulsar-max /system/bin/sh -c "for a in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do for b in 1 2 3 4 5 6 7 8 9 10; do getenforce | grep -q Permissive && [ -r /data/pulsar-max/supervise.sh ] && exec /system/bin/sh /data/pulsar-max/supervise.sh; sleep 2; done; done; pm grant com.yandex.io.sdk android.permission.RECORD_AUDIO; cmd appops set com.yandex.io.sdk RECORD_AUDIO allow; am crash com.yandex.io.sdk"
     class main
     user root
     group root

@@ -8,18 +8,23 @@ use crate::sys;
 const PACKAGE: &str = "com.yandex.io.sdk";
 const SYSTEM_APK: &str = "/system/priv-app/ServicesIosdk/ServicesIosdk.apk";
 const TFLITE_IN_APK: &str = "!/lib/arm64-v8a/libtflite.so";
+const PERMISSION: &str = "android.permission.RECORD_AUDIO";
 
 /// io.sdk can be neither disabled nor stopped (docs/max.md); a restart applies the denial.
 pub fn take_mic() -> bool {
     if !set_record_audio("ignore") {
         return false;
     }
+    // Under the appop alone io.sdk retries its AudioRecord and crashes every 10 min; without the
+    // permission it asks for it instead (docs/max.md, "Стек Яндекса").
+    permission("revoke");
     restart_io_sdk();
     info!("yandex: microphone taken from {PACKAGE}");
     true
 }
 
 pub fn give_back_mic() {
+    permission("grant");
     if set_record_audio("allow") {
         restart_io_sdk();
         info!("yandex: microphone given back to {PACKAGE}");
@@ -52,6 +57,17 @@ fn set_record_audio(mode: &str) -> bool {
             warn!("yandex: appops RECORD_AUDIO {mode}: {e}");
             false
         }
+    }
+}
+
+fn permission(verb: &str) {
+    match Command::new("/system/bin/pm")
+        .args([verb, PACKAGE, PERMISSION])
+        .status()
+    {
+        Ok(s) if s.success() => {}
+        Ok(s) => warn!("yandex: pm {verb} {PERMISSION}: {s}"),
+        Err(e) => warn!("yandex: pm {verb} {PERMISSION}: {e}"),
     }
 }
 

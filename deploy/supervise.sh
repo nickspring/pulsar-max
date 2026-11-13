@@ -54,9 +54,14 @@ rotate() {
 
 say() { echo "=== supervise: $* $(date)" >> "$LOG"; }
 
+# io.sdk started without the permission does not ask again after a grant, only a restart helps.
+# An unreadable state counts as revoked: a spare restart is harmless, a deaf io.sdk is not.
 give_back_mic() {
-  case "$(cmd appops get $IOSDK RECORD_AUDIO 2>/dev/null)" in
-    *allow*) return 0 ;;
+  had=no
+  dumpsys package $IOSDK 2>/dev/null | grep -q 'RECORD_AUDIO: granted=true' && had=yes
+  pm grant $IOSDK android.permission.RECORD_AUDIO
+  case "$had $(cmd appops get $IOSDK RECORD_AUDIO 2>/dev/null)" in
+    yes*allow*) return 0 ;;
   esac
   cmd appops set $IOSDK RECORD_AUDIO allow
   for pid in $(pidof $IOSDK); do kill -9 "$pid"; done
