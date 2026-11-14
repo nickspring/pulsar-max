@@ -1,5 +1,8 @@
 # pulsar-max
 
+[![build](https://github.com/nickspring/pulsar-max/actions/workflows/build.yml/badge.svg)](https://github.com/nickspring/pulsar-max/actions/workflows/build.yml)
+[![release](https://img.shields.io/github/v/release/nickspring/pulsar-max)](https://github.com/nickspring/pulsar-max/releases/latest)
+
 Голосовой спутник Home Assistant для Яндекс Станции Макс (`yandexstation_2`, Android 9 / YaOS).
 Станция говорит с HA по ESPHome Native API, как станции на
 [pulsar](https://github.com/Morvex885/pulsar); протоколы (ESPHome API, mDNS) берутся из крейтов
@@ -11,24 +14,30 @@ pulsar поддерживает Buildroot-станции (Миди, Лайт 2, 
 
 ## Статус
 
-В разработке. С Home Assistant на станции работают: обнаружение и подключение через ESPHome,
-объявления (`assist_satellite.announce`) и диалог, начатый из HA
-(`assist_satellite.start_conversation`): вопрос распознаётся, ответ звучит со станции. Кнопка
-Алисы начинает и отменяет диалог со звуками стока, кнопка микрофонов его запрещает, таймеры HA
-звонят и останавливаются кнопкой, щелчки крутилки приходят в HA событиями `volume_up` и
-`volume_down`. Ключевое слово «Алиса» распознаётся на станции спотером стока:
-начинает диалог, перебивает ответ и останавливает звонок таймера. Голосовые команды стока
-(«стоп», «пауза», «громче», «тише», «дальше» и др., см. «Голосовые команды») работают на станции,
-без HA. Кольцо показывает состояния голоса анимациями стока, а во время музыки на экране —
-эквалайзер стока (стиль выбирается в HA: «Music visualization», по умолчанию случайный, новый на
-каждом старте воспроизведения, как у стока; у Music Assistant смена трека не считается новым
-стартом, и стиль остаётся до следующего старта). Станция — Sendspin-плеер для Music Assistant (см. «Music
-Assistant»). Настройки из HA («Music visualization», «Voice indication», «Microphone gain»,
-«Follow-up duration», «Command start offset») хранятся на станции и переживают перезапуск и
-обновление. Установщик ставит демон с автозапуском и откатом. План —
-[docs/architecture.md](docs/architecture.md#этапы).
+В разработке, проверено на одной станции. Что работает:
 
-Zigbee не поддерживается. Радио станции работает на прошивке шлюза Яндекса со своим протоколом
+- **Home Assistant.** Станция находится и подключается как ESPHome-устройство. Работают объявления
+  (`assist_satellite.announce`) и диалог, начатый из HA (`assist_satellite.start_conversation`):
+  вопрос распознаётся, ответ звучит со станции. Таймеры HA звонят на станции.
+- **Голос.** «Алиса» распознаётся на станции спотером стока: начинает диалог, перебивает ответ и
+  останавливает звонок таймера. Команды стока («стоп», «пауза», «громче», «тише», «дальше» и др.)
+  работают на станции без HA, см. [«Голосовые команды»](#голосовые-команды).
+- **Кнопки и крутилка.** Кнопка Алисы начинает и отменяет диалог со звуками стока, кнопка микрофонов
+  его запрещает, кнопка останавливает звонок таймера. Щелчки крутилки приходят в HA событиями
+  `volume_up` и `volume_down`.
+- **Кольцо и экран.** Кольцо показывает состояния голоса анимациями стока. Во время музыки на
+  экране — эквалайзер стока. Стиль выбирается в HA («Music visualization»): по умолчанию
+  случайный, новый на каждом старте воспроизведения, как у стока. Смена трека в Music Assistant
+  стиль не меняет.
+- **Музыка.** Станция — медиаплеер HA и Sendspin-плеер для Music Assistant, см.
+  [«Music Assistant»](#music-assistant).
+- **Настройки.** «Music visualization», «Voice indication», «Microphone gain», «Follow-up
+  duration» и «Command start offset» хранятся на станции и переживают перезапуск и обновление.
+- **Установка.** Установщик ставит демон с автозапуском и откатом на прошлую версию.
+
+План — [docs/architecture.md](docs/architecture.md#этапы).
+
+**Не поддерживается: Zigbee.** Радио станции работает на прошивке шлюза Яндекса со своим протоколом
 (Telink zbhci с расширениями Яндекса), который ZHA и Zigbee2MQTT не понимают, а координатор сети —
 `io.sdk`, умный дом Яндекса. Чтобы отдать радио HA, его пришлось бы перепрошить своей прошивкой
 координатора: все устройства пришлось бы привязывать заново, а умный дом Яндекса их потеряет. Такая
@@ -36,46 +45,66 @@ Zigbee не поддерживается. Радио станции работа
 
 ## Требования
 
-- Яндекс Станция Макс с root через `/odm` (init-сервисы в `/odm/etc/init`, `rootd` переводит
-  SELinux в permissive после загрузки) и root-доступом по ssh на порту 2222 (absshd).
+- Яндекс Станция Макс с постоянным root через `/odm` (init-сервисы в `/odm/etc/init`, `rootd`
+  переводит SELinux в permissive после загрузки) и root-доступом по ssh на порту 2222 (absshd).
+  Способ получить такой root — в Telegram-сообществе [@hackalice](https://t.me/hackalice).
 - Прошивка, на которой проверялось: `5000000921`, `io.sdk` 3.367.25.
-
-## Сборка
-
-```sh
-brew install rustup                   # тулчейн берётся из rust-toolchain.toml
-brew install --cask android-ndk       # или NDK=<путь> для make
-brew install cmake                    # sendspin-cpp; первый make скачивает его исходники (git)
-# помощники: JDK 17 и Android SDK (platforms/android-33, build-tools/36.0.0) в ANDROID_HOME
-# или ~/Library/Android/sdk
-make                                  # build/pulsar-max (aarch64-linux-android, API 28) и build/helper.dex
-make check                            # fmt, clippy -D warnings, тесты max-core, max-wake,
-                                      # pulsar-sendspin, помощников, супервизора и ctl.sh на хосте
-```
+- Home Assistant с голосовым ассистентом (Assist); для музыки — Music Assistant 2.10.7 или новее.
+- На компьютере для установки: `sh`, `ssh`, `curl`, `tar` (Linux, macOS или WSL).
 
 ## Установка
 
+### Из релиза
+
+Номер последней версии — на странице
+[Releases](https://github.com/nickspring/pulsar-max/releases/latest).
+
 ```sh
-make
-tools/install.sh 192.168.1.50                    # установка или обновление; запускается и после перезагрузки
-ssh -p 2222 root@192.168.1.50 sh /data/pulsar-max/ctl.sh status   # enable|disable|restart|rollback|log
-tools/install.sh --uninstall 192.168.1.50        # вернуть станцию Алисе (--purge: и ключи HA и Sendspin, и настройки)
+v=v0.1.0
+base=https://github.com/nickspring/pulsar-max/releases/download/$v
+curl -fLO "$base/pulsar-max-$v.tar.gz" -fLO "$base/SHA256SUMS"
+sha256sum -c --ignore-missing SHA256SUMS
+tar xzf "pulsar-max-$v.tar.gz"
+cd "pulsar-max-$v"
+tools/install.sh 192.168.1.50
 ```
 
+На macOS вместо `sha256sum` — `shasum -a 256 -c --ignore-missing SHA256SUMS`. Обновление — те же
+команды с новой версией: прежняя версия остаётся на станции для отката.
+
+### Из исходников
+
+Соберите проект (см. [«Сборка»](#сборка)) и запустите `tools/install.sh 192.168.1.50` из корня
+репозитория.
+
+### Управление и удаление
+
+```sh
+ssh -p 2222 root@192.168.1.50 sh /data/pulsar-max/ctl.sh status
+tools/install.sh --uninstall 192.168.1.50
+tools/install.sh --uninstall --purge 192.168.1.50
+```
+
+`ctl.sh` принимает также `enable`, `disable`, `restart`, `rollback` и `log`. `--uninstall`
+возвращает станцию Алисе; с `--purge` удаляются и ключи HA и Sendspin, и настройки.
+
+### Как это работает
+
 Установщик кладёт демон в `/data/pulsar-max` и один файл `/odm/etc/init/pulsar-max.rc`: после
-перезагрузки демон стартует сам, через несколько секунд после загрузки системы. Пять падений
-подряд — откат на предыдущую версию; если не работает и она, микрофон возвращается Алисе, а
-pulsar-max остаётся выключенным до `ctl.sh enable` или новой установки. Демон
-забирает микрофон у Алисы; `ctl.sh disable` и удаление возвращают его. Подробности —
+перезагрузки демон стартует сам, через несколько секунд после загрузки системы. Пять падений подряд
+— откат на предыдущую версию; если не работает и она, микрофон возвращается Алисе, а pulsar-max
+остаётся выключенным до `ctl.sh enable` или новой установки. Демон забирает микрофон у Алисы;
+`ctl.sh disable` и удаление возвращают его. Подробности —
 [docs/architecture.md, «Автозапуск»](docs/architecture.md#автозапуск).
 
 Если к станции по HDMI подключён телевизор, на нём может появиться системный запрос разрешить
 приложению Яндекса доступ к микрофону. Не нажимайте «Разрешить»: микрофон всё равно останется у
-pulsar-max, а приложение Яндекса снова начнёт падать каждые 10 минут (docs/max.md, «Стек
-Яндекса»).
+pulsar-max, а приложение Яндекса снова начнёт падать каждые 10 минут
+([docs/max.md, «Стек Яндекса»](docs/max.md#стек-яндекса)).
 
-Если ssh после каждой перезагрузки жалуется на смену ключа хоста, у absshd нет каталога для
-ключа: `mkdir -m 700 /data/local/tmp/absshd` на станции (docs/max.md, «Платформа»).
+Если ssh после каждой перезагрузки жалуется на смену ключа хоста, у absshd нет каталога для ключа:
+выполните на станции `mkdir -m 700 /data/local/tmp/absshd`
+([docs/max.md, «Платформа»](docs/max.md#платформа)).
 
 ## Голосовые команды
 
@@ -103,23 +132,58 @@ pulsar-max, а приложение Яндекса снова начнёт па�
 
 ## Music Assistant
 
-Станция объявляет себя в сети Sendspin-плеером «Яндекс Станция Макс» (порт 8928), и Music
-Assistant находит её сам. Нужен Music Assistant 2.10.7 или новее (проверено с 2.10.11): у 2.10.2 и
-старше другая версия протокола сопряжения, и рукопожатие не проходит (docs/max.md, «Проверено»).
-Синхронность в группе с другими плеерами пока не проверялась. Громкость плеера в MA — это громкость станции,
-та же, что у крутилки; поворот крутилки снимает mute. Пока говорит голосовой ассистент, музыка
-приглушается. Музыка из HA (URL,
-пауза, стоп) забирает станцию у Sendspin, и наоборот.
+Станция объявляет себя в сети Sendspin-плеером «Яндекс Станция Макс» (порт 8928), и Music Assistant
+находит её сам. Нужен Music Assistant 2.10.7 или новее (проверено с 2.10.11): у 2.10.2 и старше
+другая версия протокола сопряжения, и рукопожатие не проходит
+([docs/max.md, «Проверено»](docs/max.md#проверено)). Синхронность в группе с другими плеерами пока
+не проверялась.
+
+Громкость плеера в MA — это громкость станции, та же, что у крутилки; поворот крутилки снимает mute.
+Пока говорит голосовой ассистент, музыка приглушается. Музыка из HA (URL, пауза, стоп) забирает
+станцию у Sendspin, и наоборот.
 
 По умолчанию станция принимает Sendspin-подключения без сопряжения, как pulsar. Чтобы требовать
-сопряжение:
+сопряжение, выполните на станции:
 
 ```sh
-ssh -p 2222 root@192.168.1.50 'echo 0 > /data/pulsar-max/sendspin/unpaired_access; sh /data/pulsar-max/ctl.sh restart'
+echo 0 > /data/pulsar-max/sendspin/unpaired_access
+sh /data/pulsar-max/ctl.sh restart
 ```
 
 Код и токен сопряжения пишутся в журнал (`ctl.sh log`); если сервер просит подтверждения на
 станции, нажмите кнопку Алисы.
+
+## Сборка
+
+Нужна только для сборки из исходников; готовые архивы — в
+[Releases](https://github.com/nickspring/pulsar-max/releases).
+
+### macOS
+
+```sh
+brew install rustup                # тулчейн берётся из rust-toolchain.toml
+brew install --cask android-ndk    # или NDK=<путь> для make
+brew install cmake                 # для sendspin-cpp; первый make скачивает его исходники
+make                               # build/pulsar-max и build/helper.dex
+make check                         # fmt, clippy -D warnings и тесты на хосте
+```
+
+Для помощников нужны JDK 17 и Android SDK с `platforms/android-33` и `build-tools/36.0.0` в
+`ANDROID_HOME` или `~/Library/Android/sdk`. `make` собирает демон под `aarch64-linux-android`
+(API 28); `make check` прогоняет тесты max-core, max-wake, pulsar-sendspin, помощников,
+супервизора и `ctl.sh`.
+
+### Linux
+
+То же самое: rustup, CMake, JDK 17 и Android SDK с `ndk;30.0.16248370`, `platforms;android-33` и
+`build-tools;36.0.0` (через `sdkmanager`); `ANDROID_HOME` и `ANDROID_NDK_HOME` указывают на них.
+Так собирает CI.
+
+### CI и релизы
+
+CI ([`.github/workflows/build.yml`](.github/workflows/build.yml)) на каждый push в `main` и pull
+request прогоняет `make check` и `make`. На тег `v*` он выкладывает релиз: архив для установки,
+`pulsar-max-<версия>.debug` (бинарь с символами для расшифровки падений) и `SHA256SUMS`.
 
 ## Структура
 

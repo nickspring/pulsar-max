@@ -6,7 +6,10 @@ SDK="${ANDROID_HOME:-$HOME/Library/Android/sdk}"
 ANDROID_JAR="$SDK/platforms/android-33/android.jar"
 BUILD_TOOLS="$SDK/build-tools/36.0.0"
 D8="$BUILD_TOOLS/d8"
-JAVA_HOME="$(/usr/libexec/java_home -v 17)"
+if [ -x /usr/libexec/java_home ]; then
+  JAVA_HOME="$(/usr/libexec/java_home -v 17)"
+fi
+: "${JAVA_HOME:?set JAVA_HOME to a JDK 17}"
 export JAVA_HOME PATH="$JAVA_HOME/bin:$PATH"
 CORE="PlayerCore.java Capture.java"
 

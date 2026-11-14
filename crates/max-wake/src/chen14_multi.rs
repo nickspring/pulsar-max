@@ -338,7 +338,10 @@ mod tests {
                 got.extend(d.push(posteriors).map(|h| (h.frame, h.command)));
                 if let Some(want) = want {
                     let conf: Vec<u32> = d.confidences.iter().map(|c| c.to_bits()).collect();
-                    assert_eq!(&conf, want, "{} frame {frame}", case.name);
+                    // powf differs by one ULP between libms (macOS vs glibc x86-64).
+                    let close = conf.len() == want.len()
+                        && conf.iter().zip(want).all(|(g, w)| g.abs_diff(*w) <= 1);
+                    assert!(close, "{} frame {frame}: {conf:?} vs {want:?}", case.name);
                 }
             }
             assert_eq!(got, case.hits, "{}", case.name);
