@@ -53,10 +53,19 @@ make check                            # fmt, clippy -D warnings, тесты max-
                                       # pulsar-sendspin, помощников, супервизора и ctl.sh на хосте
 ```
 
+CI (`.github/workflows/build.yml`) на каждый push и pull request прогоняет `make check` и `make` на
+Linux с теми же версиями NDK и SDK; на тег `v*` выкладывает архив, `pulsar-max.debug` для
+расшифровки падений и `SHA256SUMS` в Releases.
+
 ## Установка
 
+Готовая сборка — архив `pulsar-max-<версия>.tar.gz` на странице
+[Releases](https://github.com/nickspring/pulsar-max/releases): распакуйте его и запускайте команды ниже
+из получившегося каталога, без `make`. Нужны постоянный root на станции и ssh на порту 2222; способ
+получить его на Макс — в Telegram-сообществе [@hackalice](https://t.me/hackalice).
+
 ```sh
-make
+make                                             # только при сборке из исходников
 tools/install.sh 192.168.1.50                    # установка или обновление; запускается и после перезагрузки
 ssh -p 2222 root@192.168.1.50 sh /data/pulsar-max/ctl.sh status   # enable|disable|restart|rollback|log
 tools/install.sh --uninstall 192.168.1.50        # вернуть станцию Алисе (--purge: и ключи HA и Sendspin, и настройки)
