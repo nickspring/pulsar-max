@@ -4,8 +4,9 @@
 use crate::dialog::FOLLOWUP_DURATION_MAX_S;
 use crate::screen::Viz;
 
-/// Provisional: at 1-2 m `vqe_0` speech sits near -62 dBFS (docs/max.md, "Звук").
-pub const DEFAULT_MIC_GAIN_DB: u32 = 24;
+/// At 1-2 m `vqe_0` speech sits near -62 dBFS (docs/max.md, "Звук"); with 24 dB faster-whisper
+/// (large-v3) dropped such requests as silence, with 36 dB it heard them.
+pub const DEFAULT_MIC_GAIN_DB: u32 = 36;
 pub const MIC_GAIN_MAX_DB: u32 = 40;
 pub const DEFAULT_FOLLOWUP_S: u32 = 10;
 pub const COMMAND_OFFSET_MIN_MS: i32 = -100;
@@ -178,13 +179,13 @@ mod tests {
     }
 
     #[test]
-    fn defaults_match_the_daemon_before_persistence() {
+    fn defaults() {
         let d = Settings::default();
         assert_eq!(d.viz, Viz::Random);
         assert!(d.voice_indication);
         assert_eq!(
             (d.mic_gain_db, d.followup_s, d.command_offset_ms),
-            (24, 10, 0)
+            (36, 10, 0)
         );
     }
 
