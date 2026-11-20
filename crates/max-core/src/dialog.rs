@@ -536,6 +536,10 @@ impl Dialog {
         match timer {
             Timer::Watchdog => {
                 if matches!(self.phase, Phase::Listening | Phase::Processing) {
+                    log::warn!(
+                        "voice: no pipeline progress while {:?}, giving up",
+                        self.phase
+                    );
                     self.abort(fx);
                 }
             }
