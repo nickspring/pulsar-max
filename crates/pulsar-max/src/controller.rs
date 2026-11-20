@@ -537,7 +537,8 @@ impl Fx {
             Shown::Idle => MediaState::Idle,
             Shown::Playing => MediaState::Playing,
             Shown::Paused => MediaState::Paused,
-            Shown::Announcing => MediaState::Announcing,
+            // HA's ESPHome media player lacks ANNOUNCING (KeyError); ESPHome firmware sends PLAYING.
+            Shown::Announcing => MediaState::Playing,
         };
         self.api
             .publish_media(st, self.volume.shown().unwrap_or(0.0), self.muted);
