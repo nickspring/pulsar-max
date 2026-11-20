@@ -1,5 +1,7 @@
+use std::collections::HashMap;
+
 use log::{debug, info, warn};
-use max_core::audio::{apply_gain, gain_from_db};
+use max_core::audio::{SentAudio, apply_gain, gain_from_db};
 use max_core::commands::{
     MusicAction, MusicOp, MusicOwnership, MusicState, TransportCmd, command_of, music_ops,
 };
@@ -67,6 +69,7 @@ pub struct Fx {
     ring: Option<RingHandle>,
     timers: Timers<Tick>,
     streaming: bool,
+    sent: SentAudio,
     ducked: bool,
     announcing: bool,
     muted: bool,
@@ -102,6 +105,7 @@ impl Controller {
                 ring,
                 timers: Timers::new(),
                 streaming: false,
+                sent: SentAudio::default(),
                 ducked: false,
                 announcing: false,
                 muted: false,
@@ -265,7 +269,7 @@ impl Controller {
     pub fn on_audio(&mut self, chunk: AudioChunk) {
         self.preroll.push(chunk.pos, &chunk.samples);
         if self.fx.streaming {
-            self.send_audio(chunk.samples);
+            self.send_audio(Some(chunk.pos), chunk.samples);
         }
     }
 
@@ -276,7 +280,7 @@ impl Controller {
         let start = preroll::command_start(end, self.settings.command_offset_ms);
         let preroll = self.preroll.since(start);
         for chunk in preroll.chunks(PREROLL_CHUNK) {
-            self.send_audio(chunk.to_vec());
+            self.send_audio(None, chunk.to_vec());
         }
     }
 
@@ -298,8 +302,9 @@ impl Controller {
         info!("command '{phrase}': {outcome:?}");
     }
 
-    fn send_audio(&self, mut samples: Vec<i16>) {
+    fn send_audio(&mut self, pos: Option<u64>, mut samples: Vec<i16>) {
         apply_gain(&mut samples, gain_from_db(self.settings.mic_gain_db));
+        self.fx.sent.push(pos, &samples);
         self.fx.api.voice_send_audio(samples);
     }
 
@@ -342,14 +347,7 @@ impl Controller {
             ApiEvent::VoiceSubscribed(true) => {}
             ApiEvent::VoiceEvent { event, data } => {
                 let ev = va(event);
-                if ev == Va::SttEnd {
-                    debug!(
-                        "voice: stt '{}'",
-                        data.get("text").map_or("", String::as_str)
-                    );
-                } else if ev == Va::Error {
-                    debug!("voice: error {:?}", data.get("code"));
-                }
+                log_voice_event(ev, &data);
                 self.dialog.on_va(ev, &data, &mut self.fx);
             }
             ApiEvent::VoiceStartFailed { run } => self.dialog.on_start_failed(run, &mut self.fx),
@@ -634,8 +632,10 @@ impl Effects for Fx {
     }
 
     fn set_streaming(&mut self, on: bool) {
-        if self.streaming != on {
-            debug!("voice: streaming {on}");
+        if on && !self.streaming {
+            self.sent = SentAudio::default();
+        } else if !on && self.streaming {
+            info!("voice: sent {}", self.sent);
         }
         self.streaming = on;
     }
@@ -686,6 +686,16 @@ fn media_cmd(cmd: MediaCommand) -> MediaCmd {
         MediaCommand::VolumeUp => MediaCmd::VolumeUp,
         MediaCommand::VolumeDown => MediaCmd::VolumeDown,
         _ => MediaCmd::Other,
+    }
+}
+
+fn log_voice_event(ev: Va, data: &HashMap<String, String>) {
+    let get = |k: &str| data.get(k).map_or("", String::as_str);
+    match ev {
+        Va::SttEnd | Va::TtsStart => info!("voice: {ev:?} '{}'", get("text")),
+        Va::IntentEnd => info!("voice: {ev:?} continue={}", get("continue_conversation")),
+        Va::Error => warn!("voice: {ev:?} {}: {}", get("code"), get("message")),
+        _ => info!("voice: {ev:?}"),
     }
 }
 

@@ -95,6 +95,55 @@ pub fn apply_gain(samples: &mut [i16], gain: f32) {
     }
 }
 
+/// 16 kHz voice audio sent to HA in one run; a gap is a jump in stream positions (lost audio).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SentAudio {
+    samples: u64,
+    sum_sq: f64,
+    peak: u16,
+    next_pos: Option<u64>,
+    gaps: u32,
+}
+
+impl SentAudio {
+    /// `pos` is the stream position of the first sample; pre-roll has none (it is contiguous).
+    pub fn push(&mut self, pos: Option<u64>, samples: &[i16]) {
+        if let Some(pos) = pos {
+            if self.next_pos.is_some_and(|p| p != pos) {
+                self.gaps += 1;
+            }
+            self.next_pos = Some(pos + samples.len() as u64);
+        }
+        for &s in samples {
+            self.sum_sq += f64::from(s) * f64::from(s);
+            self.peak = self.peak.max(s.unsigned_abs());
+        }
+        self.samples += samples.len() as u64;
+    }
+}
+
+impl std::fmt::Display for SentAudio {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.samples == 0 {
+            return f.write_str("no audio");
+        }
+        let n = self.samples as f64;
+        let rms = (self.sum_sq / n).sqrt();
+        write!(
+            f,
+            "{:.1} s, peak {:.0} dBFS, rms {:.0} dBFS, gaps {}",
+            n / 16_000.0,
+            dbfs(f64::from(self.peak)),
+            dbfs(rms),
+            self.gaps
+        )
+    }
+}
+
+fn dbfs(amplitude: f64) -> f64 {
+    20.0 * (amplitude.max(1.0) / f64::from(i16::MAX)).log10()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,5 +387,42 @@ mod tests {
         let mut samples = [i16::MIN, -1, 0, 1, i16::MAX];
         apply_gain(&mut samples, gain_from_db(0));
         assert_eq!(samples, [i16::MIN, -1, 0, 1, i16::MAX]);
+    }
+
+    #[test]
+    fn sent_audio_without_audio_says_so() {
+        assert_eq!(SentAudio::default().to_string(), "no audio");
+    }
+
+    #[test]
+    fn sent_audio_reads_silence_as_minus_90() {
+        let mut a = SentAudio::default();
+        a.push(None, &[0; 8_000]);
+        a.push(Some(0), &[0; 8_000]);
+        assert_eq!(a.to_string(), "1.0 s, peak -90 dBFS, rms -90 dBFS, gaps 0");
+    }
+
+    #[test]
+    fn sent_audio_measures_full_scale_and_quieter_audio() {
+        let mut a = SentAudio::default();
+        a.push(None, &[i16::MIN, i16::MAX].repeat(4_000));
+        assert_eq!(a.to_string(), "0.5 s, peak 0 dBFS, rms 0 dBFS, gaps 0");
+
+        let mut a = SentAudio::default();
+        a.push(None, &[3_277, -3_277].repeat(12_000));
+        a.push(None, &[0; 8_000]);
+        assert_eq!(a.to_string(), "2.0 s, peak -20 dBFS, rms -21 dBFS, gaps 0");
+    }
+
+    #[test]
+    fn sent_audio_counts_position_jumps() {
+        let mut a = SentAudio::default();
+        a.push(None, &[0; 100]);
+        a.push(Some(1_000), &[0; 512]);
+        a.push(Some(1_512), &[0; 512]);
+        a.push(Some(2_048), &[0; 512]);
+        a.push(Some(18_048), &[0; 512]);
+        a.push(Some(18_560), &[0; 512]);
+        assert!(a.to_string().ends_with(", gaps 2"), "{a}");
     }
 }
